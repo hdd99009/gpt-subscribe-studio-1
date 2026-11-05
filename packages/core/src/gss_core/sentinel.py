@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -25,6 +26,36 @@ logger = logging.getLogger("gss.sentinel")
 def last_failure() -> dict:
     """Failure metadata for the current request thread; never contains token output."""
     return dict(getattr(_diagnostic, "failure", {}))
+
+
+def _run_bridge(payload: bytes, timeout_s: float, env: dict) -> subprocess.CompletedProcess:
+    command = [os.environ.get("SENTINEL_NODE") or "node", str(_BRIDGE)]
+    options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+        if os.name == "nt" else {"start_new_session": True}
+    )
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          cwd=str(_ASSETS), env=env, **options) as process:
+        try:
+            stdout, stderr = process.communicate(payload, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            # Stop descendants before the parent disappears, including Windows venv launchers.
+            if os.name == "nt":
+                try:
+                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                   capture_output=True, timeout=3, check=False,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                except (OSError, subprocess.TimeoutExpired):
+                    logger.warning("sentinel_process_tree_cleanup_failed")
+                process.kill()
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(command, timeout_s, output=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _safe_diagnostic(value: str, proxy: str, cookie_header: str) -> str:
@@ -150,6 +181,7 @@ def mint(
             "maxTouchPoints": 0,
             "cookieHeader": cookie_header,
             "sentinelOrigin": "https://chatgpt.com",
+            "requestTimeoutMs": min(30000, max(1000, int((timeout_s - 5) * 1000))),
         },
         separators=(",", ":"),
     ).encode("utf-8")
@@ -157,18 +189,14 @@ def mint(
     env.setdefault("PYTHON_BIN", sys.executable)
     env.setdefault("SENTINEL_PYTHON", sys.executable)
     try:
-        process = subprocess.run(
-            [os.environ.get("SENTINEL_NODE") or "node", str(_BRIDGE)],
-            input=payload,
-            capture_output=True,
-            timeout=timeout_s,
-            cwd=str(_ASSETS),
-            env=env,
-            check=False,
-        )
+        process = _run_bridge(payload, timeout_s, env)
     except FileNotFoundError:
         return failed("node_missing")
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", "replace")
+        for reason in ("network_timeout", "network_error"):
+            if f"sentinel_transport_failed reason={reason} " in stderr:
+                return failed(reason, "proxy transport failed before overall deadline")
         return failed("node_timeout", f"timeout_seconds={timeout_s}")
     output = (process.stdout or b"").decode("utf-8", "replace").strip()
     if not output:
@@ -181,7 +209,10 @@ def mint(
     if not isinstance(result, dict):
         return failed("invalid_bridge_result")
     if result.get("error") or not result.get("main"):
-        return failed("bridge_error", str(result.get("error") or "missing main result"))
+        reason = result.get("reason")
+        if reason not in {"network_timeout", "network_error"}:
+            reason = "bridge_error"
+        return failed(reason, str(result.get("error") or "missing main result"))
     try:
         token = json.loads(str(result.get("main") or ""))
     except json.JSONDecodeError:

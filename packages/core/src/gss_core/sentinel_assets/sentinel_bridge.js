@@ -15,6 +15,7 @@
 const fs = require("fs");
 const path = require("path");
 const vm = require("vm");
+const transport = require("./sentinel_transport.js");
 
 // Resolve the Python used by the project before falling back to PATH. The
 // proxy transport helper is launched from this Node process, and Windows
@@ -282,7 +283,7 @@ function curlDaemonSockets() {
 
 let curlDaemonCursor = 0;
 
-function residentCurlFetch(proxy, url, opts) {
+function residentCurlFetch(proxy, url, opts, timeoutMs) {
   const sockets = curlDaemonSockets();
   if (!sockets.length) return null;
   const net = require("net");
@@ -302,7 +303,7 @@ function residentCurlFetch(proxy, url, opts) {
       settled = true;
       try { sock.destroy(); } catch (_) {}
       reject(new Error("resident curl timeout"));
-    }, 130000);
+    }, timeoutMs + 2000);
     if (timer.unref) timer.unref();
     sock.on("connect", () => {
       try {
@@ -312,7 +313,7 @@ function residentCurlFetch(proxy, url, opts) {
           headers: opts.headers || {},
           body: opts.body == null ? null : String(opts.body),
           proxy,
-          timeout: 120,
+          timeout: timeoutMs / 1000,
         }));
       } catch (e) {
         if (!settled) { settled = true; clearTimeout(timer); reject(e); }
@@ -351,53 +352,14 @@ function curlDaemonCursorSafe() {
   return curlDaemonCursor;
 }
 
-function makePythonCurlFetch(proxy) {
-  const { spawn } = require("child_process");
+function makePythonCurlFetch(proxy, timeoutMs, onFailure) {
   const helper = require("path").join(__dirname, "sentinel_curl_fetch.py");
   const python = resolvePython();
-  function spawnCurlFetch(url, opts) {
-    opts = opts || {};
-    return new Promise((resolve, reject) => {
-      const child = spawn(python, [helper], { stdio: ["pipe", "pipe", "pipe"] });
-      const stdout = [];
-      const stderr = [];
-      child.stdout.on("data", (chunk) => stdout.push(chunk));
-      child.stderr.on("data", (chunk) => stderr.push(chunk));
-      child.on("error", reject);
-      child.on("close", (code) => {
-        if (code !== 0) {
-          reject(new Error(Buffer.concat(stderr).toString("utf8").slice(0, 500) || `python curl exit ${code}`));
-          return;
-        }
-        try {
-          const result = JSON.parse(Buffer.concat(stdout).toString("utf8"));
-          const status = Number(result.status || 0);
-          const body = String(result.body || "");
-          resolve({
-            status,
-            ok: status >= 200 && status < 300,
-            headers: { get: () => null },
-            text: async () => body,
-            json: async () => JSON.parse(body),
-          });
-        } catch (error) {
-          reject(error);
-        }
-      });
-      child.stdin.end(JSON.stringify({
-        url: String(url),
-        method: opts.method || "GET",
-        headers: opts.headers || {},
-        body: opts.body == null ? null : String(opts.body),
-        proxy,
-        timeout: 120,
-      }));
-    });
-  }
+  const spawnCurlFetch = transport.makePythonCurlFetch({ python, helper, proxy, timeoutMs, onFailure });
 
   return function pythonCurlFetch(url, opts) {
     opts = opts || {};
-    const viaDaemon = residentCurlFetch(proxy, url, opts);
+    const viaDaemon = residentCurlFetch(proxy, url, opts, timeoutMs);
     if (!viaDaemon) return spawnCurlFetch(url, opts);
     return viaDaemon.catch(() => spawnCurlFetch(url, opts));
   };
@@ -418,6 +380,13 @@ async function handleRequest(raw) {
   const deviceId = args.deviceId || "";
   const flow = args.flow || "oauth_create_account";
   const proxy = args.proxy || "";
+  const timeoutMs = Math.max(1000, Math.min(Number(args.requestTimeoutMs) || 30000, 30000));
+  let networkFailure = "";
+  function onNetworkFailure(reason) {
+    networkFailure = reason;
+    // Fixed metadata only: no URL, cookies, session, proxy credentials or token output.
+    process.stderr.write(`sentinel_transport_failed reason=${reason} timeout_ms=${timeoutMs}\n`);
+  }
   const version = args.version || "20260219f9f6";
   const pageUrl = args.pageUrl || "https://auth.openai.com/about-you";
   const language = args.language || "en-US";
@@ -460,8 +429,12 @@ async function handleRequest(raw) {
     } else {
       // SOCKS 代理在 Windows 系统 curl/Schannel 下会出现
       // SEC_E_NO_CREDENTIALS；复用项目 curl_cffi 的 BoringSSL TLS 栈。
-      fetchImpl = makePythonCurlFetch(proxy);
+      fetchImpl = makePythonCurlFetch(proxy, timeoutMs, onNetworkFailure);
     }
+  }
+
+  if (!proxy || /^https?:/i.test(proxy)) {
+    fetchImpl = transport.boundedFetch(fetchImpl, timeoutMs, onNetworkFailure);
   }
 
   const assetsDir = __dirname;
@@ -533,18 +506,21 @@ async function handleRequest(raw) {
     const p = SDK.__proto2(flow);
     rawDriver = await Promise.resolve(p);
   } catch (e) {
-    return JSON.stringify({ error: "proto2: " + (e && e.stack || e) });
+    return JSON.stringify({ error: "proto2: " + (e && e.stack || e), reason: networkFailure });
+  } finally {
+    // No more network work is needed once the SDK resolves or rejects.
+    if (dispatcher && typeof dispatcher.destroy === "function") await dispatcher.destroy().catch(() => {});
   }
 
   let rd;
   try {
     rd = JSON.parse(String(rawDriver));
   } catch (e) {
-    return JSON.stringify({ error: "driver decode: " + e.message, raw: String(rawDriver).slice(0, 300) });
+    return JSON.stringify({ error: "driver decode: " + e.message, reason: networkFailure, raw: String(rawDriver).slice(0, 300) });
   }
 
   if (!rd.c) {
-    return JSON.stringify({ error: "driver 无 c", soErr: rd.soErr || "", raw: String(rawDriver).slice(0, 300) });
+    return JSON.stringify({ error: "driver 无 c", reason: networkFailure, soErr: rd.soErr || "", raw: String(rawDriver).slice(0, 300) });
   }
 
   const g = makeGenerator(ua, cores, language, timezone, screenW, screenH);
@@ -572,15 +548,6 @@ async function handleRequest(raw) {
     hasSo: !!rd.so,
   });
 
-  // token 已写完，优雅关闭 undici 连接后自然退出，避开 Windows libuv 退出断言
-  // （该断言发生在 stdout 写出之后，不影响结果；但会让子进程 exit code 变脏）。
-  // 只关闭本次请求构造的 ProxyAgent。常驻模式下不能碰全局 dispatcher，
-  // 否则会连带废掉后续请求要复用的连接池。
-  if (dispatcher && typeof dispatcher.close === "function") {
-    try {
-      await Promise.resolve(dispatcher.close()).catch(() => {});
-    } catch (_) {}
-  }
   return out;
 }
 

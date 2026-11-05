@@ -691,7 +691,9 @@ class ChatGPTClient:
         if not value:
             from .sentinel import last_failure
             reason = last_failure().get("reason", "unknown")
-            labels = {"node_missing": "未找到 Node", "node_timeout": "Node 执行超时",
+            labels = {"node_missing": "未找到 Node", "node_timeout": "Node 总执行时间超过上限",
+                      "network_timeout": "出口网络请求超时，请检查代理线路",
+                      "network_error": "出口网络连接失败，请检查代理线路",
                       "assets_missing": "缺少本地脚本", "bridge_error": "脚本或上游响应异常",
                       "empty_output": "Node 未返回结果", "invalid_bridge_json": "脚本输出格式异常"}
             raise DomainError(
