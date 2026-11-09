@@ -5,6 +5,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import {
   bindAndPayProtocol,
+  cancelOrderRenewal,
+  checkSession,
   createOrder,
   getBindAndPayProtocol,
   type BindAndPayProtocolInput,
@@ -14,6 +16,9 @@ import {
 import { PROTOCOL_STAGE_LABELS, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../src/card-payment/protocolBind";
 import { ProtocolPayPanel } from "../src/components/ProtocolPayPanel";
 import { ResultPanel } from "../src/components/ResultPanel";
+import { HistoryTable } from "../src/components/HistoryTable";
+import { loadHistory, recordOrder } from "../src/api/history";
+import { elementPaymentMethod } from "../src/card-payment/stripePaymentMethod";
 import { OrderNew } from "../src/pages/OrderNew";
 
 const order: Order = {
@@ -69,12 +74,39 @@ test("Plus starts with empty card and real-address fields while prefiling only a
   assert.ok(!html.includes("4242424242424242")); // release-check: ignore
 });
 
+test("Plus exposes an unchecked Stripe direct option beside the payment action", () => {
+  const html = renderPanel();
+  assert.ok(html.includes("Stripe 支付直连"));
+  assert.ok(html.includes("ChatGPT 请求使用建单出口"));
+  const toggle = (html.match(/<input\b[^>]*>/g) || []).find((field) => field.includes('type="checkbox"'));
+  assert.ok(toggle);
+  assert.ok(!toggle.includes("checked"));
+});
+
+test("Plus payment POST carries an explicitly selected direct route", async () => {
+  const originalFetch = globalThis.fetch;
+  let payload: Record<string, unknown> | undefined;
+  globalThis.fetch = async (_url, init) => {
+    payload = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ state: "pending", stage: "checkout", stripe_direct: true }), { status: 200 });
+  };
+  try {
+    const result = await bindAndPayProtocol(order.id, { ...input, stripe_direct: true });
+    assert.equal(payload?.stripe_direct, true);
+    assert.equal(result.stripe_direct, true);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test("new Plus order configuration retains both protocol and Stripe input modes", () => {
   const html = renderToStaticMarkup(<MantineProvider><OrderNew onRecord={() => {}} /></MantineProvider>);
   assert.ok(html.includes("协议提交（服务端提交卡号）"));
   assert.ok(html.includes("Stripe 输入框（浏览器换 pm_）"));
   assert.ok(html.includes("账单地址（创建结账前填写）"));
+  assert.ok(html.includes("检测 Session 与会员状态"));
   assert.ok(html.includes('data-testid="checkout-billing-form"'));
+  assert.ok(html.includes('data-testid="random-tax-free-address"'));
+  assert.ok(html.includes("随机免税州地址"));
+  assert.ok(html.includes("AK / DE / MT / NH / OR"));
   assert.ok(html.includes("confirmation_tokens"));
   assert.ok(html.includes("ChatGPT confirm"));
   assert.ok(html.includes("PaymentIntent confirm"));
@@ -83,6 +115,59 @@ test("new Plus order configuration retains both protocol and Stripe input modes"
     assert.ok(!html.includes(marker), marker);
   }
   assert.ok(!html.includes("plus-saved-card-panel"));
+});
+
+test("session inspection sends its session to the read-only inspection endpoint", async () => {
+  const previous = globalThis.fetch;
+  let request: { url: string; body: unknown; method?: string } | undefined;
+  globalThis.fetch = async (url, init) => {
+    request = { url: String(url), body: JSON.parse(String(init?.body)), method: init?.method };
+    return new Response(JSON.stringify({ valid: true, email: "account@example.test", plan_type: "plus",
+      active: true, will_renew: false, session: "renewed-fixture" }), { status: 200 });
+  };
+  try {
+    const result = await checkSession("original-fixture");
+    assert.deepEqual(request, { url: "/api/sessions/check", body: { session: "original-fixture" }, method: "POST" });
+    assert.equal(result.email, "account@example.test");
+    assert.equal(result.session, "renewed-fixture");
+  } finally { globalThis.fetch = previous; }
+});
+
+test("history keeps account email and last four digits through later order snapshots", () => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const saved = new Map<string, string>();
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: {
+    getItem: (key: string) => saved.get(key) ?? null,
+    setItem: (key: string, value: string) => saved.set(key, value),
+  } });
+  try {
+    saved.set("gss.history.v1", JSON.stringify([{ id: "old-record", plan: "plus", country: "US", status: "delivered", at: 1 }]));
+    recordOrder({ ...order, session_email: "account@example.test", card_last4: "4242", billing: { email: "receipt@example.test" } });
+    const list = recordOrder({ ...order, status: "delivered", session_email: null, card_last4: null });
+    assert.equal(list[0].email, "account@example.test");
+    assert.equal(list[0].card_last4, "4242");
+    assert.equal(loadHistory().length, 2);
+    const html = renderToStaticMarkup(<MantineProvider><HistoryTable items={list} /></MantineProvider>);
+    assert.ok(html.includes("邮箱") && html.includes("卡号后4位"));
+    assert.ok(html.includes("account@example.test") && html.includes("4242"));
+    assert.ok(html.includes("—"));
+    recordOrder({ ...order, id: "bad-card-metadata", card_last4: input.card.number });
+    const stored = saved.get("gss.history.v1") || "";
+    assert.ok(!stored.includes(input.card.number));
+    assert.ok(!stored.includes("sessionToken") && !stored.includes("accessToken"));
+  } finally {
+    if (descriptor) Object.defineProperty(globalThis, "localStorage", descriptor);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
+});
+
+test("Stripe card summary exposes only last four digits while retaining its payment-method contract", async () => {
+  let last4 = "";
+  const method = await elementPaymentMethod({ createPaymentMethod: async () => ({
+    paymentMethod: { id: "pm_fixture", card: { last4: "4242" } },
+  }) }, {}, input.billing, false, (value) => { last4 = value; });
+  assert.equal(method, "pm_fixture");
+  assert.equal(last4, "4242");
 });
 
 test("Plus payment retains the billing address used to obtain the quote", () => {
@@ -126,6 +211,42 @@ test("Plus result pages retain actual action state without offering a browser ch
   assert.ok(!html.includes("https://verify.example.invalid/fixture"));
   assert.ok(!html.includes("打开支付验证页面"));
   assert.ok(!html.includes("开通成功"));
+});
+
+test("paid order retains success when renewal cancellation needs a retry", () => {
+  const html = renderToStaticMarkup(<MantineProvider><ResultPanel protocolOnly order={{ ...order, status: "delivered",
+    renewal: { status: "failed", message: "取消续费结果待核实", retryable: true } }}
+    onReset={() => {}} onOrderChange={() => {}} /></MantineProvider>);
+  assert.ok(html.includes("开通成功"));
+  assert.ok(html.includes("支付成功，续费状态待核实"));
+  assert.ok(html.includes("重试关闭自动续费"));
+});
+
+test("confirmed payment stays visible while subscription and renewal need verification", () => {
+  const html = renderToStaticMarkup(<MantineProvider><ResultPanel protocolOnly order={{ ...order,
+    status: "verifying", payment_confirmed: true,
+    renewal: { status: "failed", message: "付款已确认，账号会话已失效，续费结果待核实", retryable: false },
+  }} onReset={() => {}} /></MantineProvider>);
+  assert.ok(html.includes("付款已确认，订阅核验中"));
+  assert.ok(html.includes("续费状态待核实"));
+  assert.ok(html.includes("账号会话已失效"));
+  assert.ok(!html.includes("开通失败"));
+});
+
+test("renewal retry only submits the cancellation operation without payment data", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: { url: string; init?: RequestInit }[] = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return new Response(JSON.stringify({ ...order, status: "delivered", renewal: {
+      status: "cancelled", message: "自动续费已关闭", will_renew: false,
+    } }), { status: 200 });
+  };
+  try {
+    const result = await cancelOrderRenewal(order.id);
+    assert.equal(result.renewal?.will_renew, false);
+    assert.deepEqual(calls, [{ url: "/api/orders/fixture/cancel-renewal", init: { method: "POST" } }]);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test("bind-and-pay POST sends the original card, real billing and explicitly confirmed quote only", async () => {

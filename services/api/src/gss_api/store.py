@@ -1,4 +1,4 @@
-"""订单存储。session / 卡字段绝不进入这里。"""
+"""订单存储及展示信息，包含账号邮箱和卡号后四位。"""
 
 from __future__ import annotations
 
@@ -23,6 +23,8 @@ class OrderView:
     quote_error: Optional[str] = None
     next_action: Optional[Dict[str, Any]] = None
     subscription: Optional[SubscriptionInfo] = None
+    payment_confirmed: bool = False
+    renewal: Optional[Dict[str, Any]] = None
     checkout_kind: Optional[str] = None
     seat_quantity: Optional[int] = None
     workspace_name: Optional[str] = None
@@ -31,6 +33,8 @@ class OrderView:
     price_interval: Optional[str] = None
     confirm_return_url: Optional[str] = None
     protocol_saved_result: Optional[Dict[str, Any]] = None
+    session_email: Optional[str] = None
+    card_last4: Optional[str] = None
 
 
 class InMemoryStore:

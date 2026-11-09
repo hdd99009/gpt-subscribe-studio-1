@@ -75,6 +75,7 @@ from gss_core.har_telemetry import (
 )
 from gss_core.saved_cards import restore_account
 from gss_core.saved_card_protocol import _factor, _stripe_error, outcome
+from gss_core.session_token import session_cookie_values
 from gss_core.stripe_protocol import PaymentOutcome
 
 logger = logging.getLogger("gss.plus_har")
@@ -128,6 +129,7 @@ class PlusHarProtocol:
         telemetry: Optional[str] = None,
         client: Optional[ChatGPTClient] = None,
         read_only: bool = False,
+        stripe_direct: bool = False,
     ) -> None:
         self.session = session or ""
         self.checkout_url = checkout_url or ""
@@ -135,6 +137,7 @@ class PlusHarProtocol:
         self.card = card or {}
         self.billing = billing or {}
         self.proxy = proxy or None
+        self.stripe_direct = stripe_direct
         self.currency = (currency or "USD").upper()
         self.timeout = float(timeout or 120.0)
         self.plan = plan or "plus"
@@ -240,9 +243,9 @@ class PlusHarProtocol:
             session.proxies = {"http": self.proxy, "https": self.proxy}
         session.headers.clear()
         session.headers.update(self.device.web_headers(referer="https://chatgpt.com/"))
-        cookies = dict(getattr(self.client, "extra_cookies", {}) or {})
-        if getattr(self.client, "session_token", ""):
-            cookies.setdefault("__Secure-next-auth.session-token", self.client.session_token)
+        cookies = session_cookie_values(
+            getattr(self.client, "session_token", ""), getattr(self.client, "extra_cookies", {})
+        )
         if getattr(self.client, "device_id", ""):
             cookies["oai-did"] = self.client.device_id
         cookies.setdefault("g_state", g_state_cookie(self.device))
@@ -263,7 +266,9 @@ class PlusHarProtocol:
         session = CurlSession(impersonate=self.device.impersonate, timeout=self.timeout)
         if hasattr(session, "trust_env"):
             session.trust_env = False
-        if self.proxy:
+        if self.stripe_direct:
+            session.proxies = {"http": "", "https": ""}
+        elif self.proxy:
             session.proxies = {"http": self.proxy, "https": self.proxy}
         session.headers.clear()
         session.headers.update(headers)
@@ -315,7 +320,10 @@ class PlusHarProtocol:
             kwargs["json"] = json_body
         if params:
             kwargs["params"] = params
-        return self._web_session().request(method, url, **kwargs)
+        response = self._web_session().request(method, url, **kwargs)
+        if self.client is not None:
+            self.client._merge_cookies(response)
+        return response
 
     # ── 0. account + sentinel ──────────────────────────────────────
     def _prepare(self) -> None:
@@ -335,6 +343,7 @@ class PlusHarProtocol:
             self.client.account_id = self.expected_account
         self.client.language = self.device.locale
         self.client.timezone = self.device.timezone
+        self.client.stripe_direct = self.stripe_direct
 
         self.telemetry = StripeTelemetry(self._m_session(), TelemetryContext(
             device=self.device,
@@ -911,6 +920,10 @@ class PlusHarProtocol:
         if not self.checkout_url and not self.checkout_id:
             raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "缺少结账会话")
         self._prepare()
+        if self.read_only:
+            page = self._read_checkout()
+            self.stage = "payment" if self.intent_id or page.get("status") == "complete" else "checkout"
+            return self._read_only_settle()
         self._prelude()
         self._sentinel("chatgpt_checkout")
 
@@ -1120,6 +1133,7 @@ def run_har_context(
         card=card or {},
         billing=billing or {},
         proxy=getattr(client, "proxy", None),
+        stripe_direct=bool(getattr(client, "stripe_direct", False)),
         currency=currency,
         customer_session_client_secret=str(spec.get("customer_session_client_secret") or ""),
         email=str((billing or {}).get("email") or ""),
@@ -1148,6 +1162,9 @@ def run_har_context(
         payload["stage"] = engine.stage
         return payload
     finally:
+        intent = engine.raw.get("intent") if isinstance(engine.raw.get("intent"), dict) else {}
+        if engine.intent_id.startswith("pi_") and intent.get("id") == engine.intent_id and intent.get("status") == "succeeded":
+            context["payment_confirmed"] = True
         context["har_device"] = engine.device.to_dict()
         if engine.ctoken:
             context["confirmation_token"] = engine.ctoken

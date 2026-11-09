@@ -23,6 +23,14 @@ export interface Order {
   quote_error?: string | null;
   next_action?: { type?: string; url?: string | null; client_secret?: string | null; challenge_type?: string; checkout_url?: string } | null;
   subscription?: { active: boolean; expires_at?: string | null; channel?: string | null } | null;
+  payment_confirmed?: boolean;
+  renewal?: {
+    status: "pending" | "cancelled" | "failed";
+    message: string;
+    will_renew?: boolean | null;
+    already_cancelled?: boolean;
+    retryable?: boolean;
+  } | null;
   checkout_kind?: string | null;
   seat_quantity?: number | null;
   workspace_name?: string | null;
@@ -32,6 +40,25 @@ export interface Order {
   confirm_return_url?: string | null;
   /** 从 accessToken 解析出的账户邮箱 */
   session_email?: string | null;
+  card_last4?: string | null;
+}
+
+export interface SessionInspection {
+  valid: boolean;
+  email?: string | null;
+  plan_type: string;
+  active: boolean;
+  expires_at?: string | null;
+  will_renew?: boolean | null;
+  session: string;
+}
+
+export async function checkSession(session: string): Promise<SessionInspection> {
+  const res = await fetchWithDeadline("/api/sessions/check", {
+    method: "POST", headers: jsonHeaders, body: JSON.stringify({ session }),
+  }, 60000, "Session 检测超时，请稍后重试");
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
 }
 
 export type SavedCardState =
@@ -241,11 +268,12 @@ export async function payOrder(
   paymentMethodToken: string,
   billing?: BillingInput,
   team?: TeamConfirmOptions,
+  cardLast4?: string,
 ): Promise<Order> {
   const res = await fetch(`/api/orders/${orderId}/pay`, {
     method: "POST",
     headers: jsonHeaders,
-    body: JSON.stringify({ payment_method_token: paymentMethodToken, billing, ...team }),
+    body: JSON.stringify({ payment_method_token: paymentMethodToken, billing, ...team, card_last4: cardLast4 }),
   });
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as Order;
@@ -257,8 +285,15 @@ export async function verifyOrder(orderId: string, paid = false): Promise<Order>
   return (await res.json()) as Order;
 }
 
+export async function cancelOrderRenewal(orderId: string): Promise<Order> {
+  const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/cancel-renewal`, { method: "POST" });
+  if (!res.ok) throw new Error(await readError(res));
+  return (await res.json()) as Order;
+}
+
 export interface ProtocolPayResult {
   state: string;
+  payment_confirmed?: boolean;
   code?: string | null;
   decline_code?: string | null;
   message?: string | null;
@@ -275,10 +310,12 @@ export interface BindAndPayProtocolInput {
   billing: BillingInput;
   expected_amount: string;
   expected_currency: string;
+  stripe_direct?: boolean;
 }
 
 export interface BindAndPayProtocolResult extends ProtocolPayResult {
   stage: "setup" | "sync" | "checkout" | "payment";
+  stripe_direct?: boolean;
   upstream_message?: string;
   upstream_status?: number;
   upstream_code?: string;
@@ -291,6 +328,7 @@ export interface ProtocolPayInput {
   card?: { number: string; cvc: string; exp_month: string; exp_year: string };
   /** 浏览器 Stripe 输入框已换好的 pm_（混合模式）。与 card 二选一。 */
   payment_method_id?: string;
+  card_last4?: string;
   billing: BillingInput;
   proxy?: string;
   /** 协议链路的可选环节，全部默认关闭 = 批量脚本模式 */
@@ -422,6 +460,17 @@ export async function saveProxy(raw: string, enabled: boolean): Promise<ProxyInf
   });
   if (!res.ok) throw new Error(await readError(res));
   return await res.json();
+}
+
+export async function disableProxies(): Promise<void> {
+  for (const role of ["checkout", "approve"]) {
+    const res = await fetchWithDeadline(`/api/settings/proxies/${role}`, {
+      method: "PUT",
+      headers: jsonHeaders,
+      body: JSON.stringify({ enabled: false }),
+    }, 15000, "停用代理超时，请刷新代理状态后重试");
+    if (!res.ok) throw new Error(await readError(res));
+  }
 }
 
 export async function testProxy(): Promise<{ ip: string; elapsed_ms: number; region: string; sid: string }> {

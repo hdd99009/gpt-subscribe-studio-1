@@ -1,7 +1,8 @@
 import { Alert, Anchor, Button, Group, Loader, Stack, Text, ThemeIcon, Title } from "@mantine/core";
 import { IconCheck, IconX } from "@tabler/icons-react";
+import { useState } from "react";
 
-import { formatAmount, type Order } from "../api/client";
+import { cancelOrderRenewal, formatAmount, type Order } from "../api/client";
 import { FAILED_STATUSES, SUCCESS_STATUSES } from "../api/history";
 import { planLabel, regionLabel } from "../plans";
 import { STATUS_LABELS } from "./OrderSummary";
@@ -10,9 +11,12 @@ interface Props {
   order: Order;
   protocolOnly?: boolean;
   onReset: () => void;
+  onOrderChange?: (order: Order) => void;
 }
 
-export function ResultPanel({ order, protocolOnly = false, onReset }: Props) {
+export function ResultPanel({ order, protocolOnly = false, onReset, onOrderChange }: Props) {
+  const [retryingRenewal, setRetryingRenewal] = useState(false);
+  const [renewalError, setRenewalError] = useState<string | null>(null);
   const success = SUCCESS_STATUSES.includes(order.status);
   const failed = FAILED_STATUSES.includes(order.status);
   const amount = formatAmount(order.amount, order.currency);
@@ -21,6 +25,8 @@ export function ResultPanel({ order, protocolOnly = false, onReset }: Props) {
     ? "开通成功"
     : failed
       ? "开通失败"
+      : order.payment_confirmed
+        ? "付款已确认，订阅核验中"
       : (STATUS_LABELS[order.status] ?? order.status);
 
   return (
@@ -45,6 +51,26 @@ export function ResultPanel({ order, protocolOnly = false, onReset }: Props) {
       {order.subscription?.active && (
         <Alert color="green" variant="light" title="订阅已生效">
           {order.subscription.expires_at ? `到期时间 ${order.subscription.expires_at}` : "订阅已经生效。"}
+        </Alert>
+      )}
+      {(success || order.payment_confirmed) && order.renewal && (
+        <Alert color={order.renewal.status === "cancelled" ? "green" : "yellow"} variant="light"
+          title={order.renewal.status === "cancelled" ? "自动续费已关闭" : order.renewal.status === "pending" ? "正在关闭自动续费" : "支付成功，续费状态待核实"}>
+          <Text size="sm">{order.renewal.message}</Text>
+          {order.renewal.status === "failed" && order.renewal.retryable && onOrderChange && (
+            <Button mt="sm" size="xs" variant="light" loading={retryingRenewal} onClick={async () => {
+              setRetryingRenewal(true);
+              setRenewalError(null);
+              try {
+                onOrderChange(await cancelOrderRenewal(order.id));
+              } catch (err) {
+                setRenewalError(err instanceof Error ? err.message : "取消续费结果暂未读到，请稍后重试");
+              } finally {
+                setRetryingRenewal(false);
+              }
+            }}>重试关闭自动续费</Button>
+          )}
+          {renewalError && <Text size="sm" c="red" mt="xs">{renewalError}</Text>}
         </Alert>
       )}
       {!protocolOnly && (order.next_action?.url || order.next_action?.checkout_url || (order.plan === "team" && order.checkout_url && !success && !failed)) && (

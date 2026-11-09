@@ -2,7 +2,7 @@ import type { BillingDetails } from "./CardFields";
 
 export interface ElementPaymentMethodClient {
   createPaymentMethod?: (data: unknown) => Promise<{
-    paymentMethod?: { id: string };
+    paymentMethod?: { id: string; card?: { last4?: string } };
     error?: { message?: string };
   }>;
 }
@@ -13,6 +13,7 @@ export async function elementPaymentMethod(
   elements: unknown,
   billing: BillingDetails,
   saveForReuse: boolean,
+  onLast4?: (last4: string) => void,
 ): Promise<string> {
   if (!stripe.createPaymentMethod) throw new Error("当前 Stripe.js 不支持 createPaymentMethod，请刷新页面重试");
   const result = await stripe.createPaymentMethod({
@@ -32,5 +33,6 @@ export async function elementPaymentMethod(
   if (result.error || !result.paymentMethod?.id?.startsWith("pm_")) {
     throw new Error(result.error?.message || "创建支付方式失败");
   }
+  onLast4?.(result.paymentMethod.card?.last4 || "");
   return result.paymentMethod.id;
 }

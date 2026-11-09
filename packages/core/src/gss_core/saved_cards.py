@@ -32,12 +32,17 @@ def restore_account(client: ChatGPTClient, expected: str = "") -> str:
 def verification_session(client: ChatGPTClient, expected_account: str) -> str:
     """Carry renewed credentials to the normal subscription adapter, only in memory."""
     restore_account(client, expected_account)
+    return session_snapshot(client)
+
+
+def session_snapshot(client: ChatGPTClient) -> str:
+    """Serialize the latest credentials without another upstream request."""
     return json.dumps({
         "accessToken": client.access_token,
         "sessionToken": client.session_token,
-        "deviceId": client.device_id,
-        "sessionId": client.oai_session_id,
-        "cookies": dict(client.extra_cookies),
+        "deviceId": getattr(client, "device_id", ""),
+        "sessionId": getattr(client, "oai_session_id", ""),
+        "cookies": dict(getattr(client, "extra_cookies", {})),
     })
 
 

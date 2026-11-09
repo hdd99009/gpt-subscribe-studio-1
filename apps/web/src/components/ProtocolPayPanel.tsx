@@ -220,14 +220,14 @@ function LegacyProtocolPayPanel({
         });
         if (browserPayment) {
           setPaymentSubmitted(true);
-          try { applyBrowserOrder(await payOrder(orderId, pmId, payloadBilling)); }
+          try { applyBrowserOrder(await payOrder(orderId, pmId, payloadBilling, undefined, stripeCard.last4 || undefined)); }
           catch (err) {
             const latest = await getOrder(orderId).catch(() => null);
             if (latest && latest.status !== "awaiting_payment") applyBrowserOrder(latest);
             throw err;
           }
         } else {
-          const out = await payProtocol(orderId, { ...shared, payment_method_id: pmId });
+          const out = await payProtocol(orderId, { ...shared, payment_method_id: pmId, card_last4: stripeCard.last4 || undefined });
           setResult(out); onDone?.(out);
         }
       } catch (err) {

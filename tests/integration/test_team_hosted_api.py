@@ -28,6 +28,9 @@ def setup_team(monkeypatch):
     calls = []
     class FakeClient:
         def close(self): pass
+        def cancel_subscription_renewal(self, *, expected_plan):
+            assert expected_plan == "team"
+            return {"will_renew": False, "already_cancelled": False}
     class Hosted:
         def __init__(self, client): pass
         def prepare(self, **kw):
@@ -64,6 +67,7 @@ def test_poll_top_level_success_delivers_and_clears_secrets(setup_team):
     r = client.post(f"/api/orders/{order_id}/team/poll")
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "delivered"
+    assert r.json()["renewal"]["status"] == "cancelled"
     assert vault.get(order_id) is None
     assert calls[0][0] == "GET-poll"
     # Duplicate poll after delivery must not require secrets or issue another upstream call.

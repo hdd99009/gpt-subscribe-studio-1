@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -45,9 +46,15 @@ class CardIn(BaseModel):
     exp_month: str = Field(min_length=1, max_length=2)
     exp_year: str = Field(min_length=2, max_length=4)
 
+    @property
+    def last4(self) -> Optional[str]:
+        digits = re.sub(r"\D", "", self.number)
+        return digits[-4:] if len(digits) >= 4 else None
+
 
 class OrderPayRequest(BaseModel):
     payment_method_token: str = ""
+    card_last4: Optional[str] = Field(default=None, pattern=r"^\d{4}$")
     billing: Optional[BillingIn] = None
     team_context_id: Optional[str] = Field(default=None, max_length=80)
     passive_captcha_token: Optional[str] = Field(default=None, max_length=20000)
@@ -73,6 +80,14 @@ class SubscriptionOut(BaseModel):
     channel: Optional[str] = None
 
 
+class RenewalOut(BaseModel):
+    status: Literal["pending", "cancelled", "failed"]
+    message: str
+    will_renew: Optional[bool] = None
+    already_cancelled: bool = False
+    retryable: bool = False
+
+
 class OrderOut(BaseModel):
     id: str
     status: str
@@ -89,6 +104,8 @@ class OrderOut(BaseModel):
     quote_error: Optional[str] = None
     next_action: Optional[Dict[str, Any]] = None
     subscription: Optional[SubscriptionOut] = None
+    payment_confirmed: bool = False
+    renewal: Optional[RenewalOut] = None
     checkout_kind: Optional[str] = None
     seat_quantity: Optional[int] = None
     workspace_name: Optional[str] = None
@@ -98,6 +115,7 @@ class OrderOut(BaseModel):
     confirm_return_url: Optional[str] = None
     # 从 accessToken(JWT) 解析出的账户邮箱，用于前端预填账单邮箱
     session_email: Optional[str] = None
+    card_last4: Optional[str] = Field(default=None, pattern=r"^\d{4}$")
 
 
 class ErrorOut(BaseModel):

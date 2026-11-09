@@ -18,6 +18,7 @@ export type BillingDetails = {
 
 export type StripeCardHandle = {
   tokenize: (billing: BillingDetails) => Promise<string>;
+  last4?: string;
 };
 
 type Props = {
@@ -116,7 +117,9 @@ export function StripeCardFields({
         paymentEl.mount(`#${targetId}`);
         setHint("卡片由 Stripe 托管输入，不会发到本站。");
         const handle: StripeCardHandle = {
+          last4: "",
           tokenize: async (billing: BillingDetails) => {
+            handle.last4 = "";
             const submitted = await elements.submit();
             if (submitted?.error) {
               throw new Error(submitted.error.message || "请检查卡片信息");
@@ -146,9 +149,11 @@ export function StripeCardFields({
               if (plain.error || !plain.confirmationToken?.id) {
                 throw new Error(plain.error?.message ?? "生成支付确认失败");
               }
+              handle.last4 = plain.confirmationToken.payment_method_preview?.card?.last4 || "";
               return plain.confirmationToken.id;
             }
-            const paymentMethodId = await elementPaymentMethod(stripe, elements, billing, requireSaveChoice);
+            const paymentMethodId = await elementPaymentMethod(stripe, elements, billing, requireSaveChoice,
+              (last4) => { handle.last4 = last4; });
             if (requirePaymentMethod) return paymentMethodId;
             const form = new URLSearchParams({
               payment_method: paymentMethodId,
@@ -238,7 +243,7 @@ declare global {
       elements: (options?: unknown) => StripeElements;
       confirmSetup?: import("./stripeSetup").StripeSetupClient["confirmSetup"];
       createConfirmationToken?: (data: unknown) => Promise<{
-        confirmationToken?: { id: string };
+        confirmationToken?: { id: string; payment_method_preview?: { card?: { last4?: string } } };
         error?: { message?: string };
       }>;
       handleNextAction?: (data: { clientSecret: string }) => Promise<{
@@ -246,7 +251,7 @@ declare global {
         error?: { message?: string };
       }>;
       createPaymentMethod?: (data: unknown) => Promise<{
-        paymentMethod?: { id: string };
+        paymentMethod?: { id: string; card?: { last4?: string } };
         error?: { message?: string };
       }>;
     };

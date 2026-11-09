@@ -7,6 +7,43 @@ from dataclasses import dataclass, field
 from typing import Any, Dict
 
 
+SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
+# The captured browser splits this cookie into 3933-character values.
+SESSION_COOKIE_CHUNK_SIZE = 3933
+
+
+def session_token_from_cookies(cookies: Dict[str, str]) -> str:
+    prefix = SESSION_COOKIE_NAME + "."
+    chunks = {
+        int(name[len(prefix):]): value
+        for name, value in cookies.items()
+        if name.startswith(prefix) and name[len(prefix):].isdigit() and value
+    }
+    if chunks:
+        indices = sorted(chunks)
+        if indices != list(range(len(chunks))):
+            return ""
+        return "".join(chunks[index] for index in indices)
+    return cookies.get(SESSION_COOKIE_NAME, "")
+
+
+def session_cookie_values(session_token: str, cookies: Dict[str, str] | None = None) -> Dict[str, str]:
+    values = dict(cookies or {})
+    session_token = session_token or session_token_from_cookies(values)
+    if not session_token:
+        return values
+    values = {
+        name: value for name, value in values.items()
+        if name != SESSION_COOKIE_NAME and not name.startswith(SESSION_COOKIE_NAME + ".")
+    }
+    if len(session_token) <= SESSION_COOKIE_CHUNK_SIZE:
+        values[SESSION_COOKIE_NAME] = session_token
+    else:
+        for index, start in enumerate(range(0, len(session_token), SESSION_COOKIE_CHUNK_SIZE)):
+            values[f"{SESSION_COOKIE_NAME}.{index}"] = session_token[start:start + SESSION_COOKIE_CHUNK_SIZE]
+    return values
+
+
 @dataclass
 class SessionBundle:
     access_token: str
@@ -14,6 +51,7 @@ class SessionBundle:
     device_id: str = ""
     oai_session_id: str = ""
     cookies: Dict[str, str] = field(default_factory=dict)
+    email: str = ""
 
 
 def parse_session(raw: str) -> str:
@@ -28,7 +66,7 @@ def parse_session_bundle(raw: str) -> SessionBundle:
         text = text.split(None, 1)[1].strip()
     
     # 处理 __Secure-next-auth.session-token=xxx 格式
-    if text.startswith("__Secure-next-auth.session-token="):
+    if text.startswith("__Secure-next-auth.session-token=") and ";" not in text:
         text = text.split("=", 1)[1].strip()
     
     if text.startswith("{") or text.startswith("["):
@@ -37,9 +75,9 @@ def parse_session_bundle(raw: str) -> SessionBundle:
         except json.JSONDecodeError as exc:
             raise ValueError("session JSON 无法解析") from exc
         return _from_mapping(data)
-    if ";" in text and "=" in text and not text.lstrip().startswith("eyJ"):
+    if "=" in text and not text.lstrip().startswith("eyJ"):
         cookies = _parse_cookie_header(text)
-        if "__Secure-next-auth.session-token" in cookies or "oai-did" in cookies:
+        if session_token_from_cookies(cookies) or "oai-did" in cookies:
             raise ValueError("请粘贴包含 accessToken 的整段 session JSON，仅 Cookie 不够")
     
     # 识别 JWE（5段）vs JWS（3段）
@@ -51,7 +89,7 @@ def parse_session_bundle(raw: str) -> SessionBundle:
             # 这是 JWE，当作 session_token 而非 access_token
             return SessionBundle(access_token="", session_token=text)
     
-    return SessionBundle(access_token=text)
+    return SessionBundle(access_token=text, email=email_from_access_token(text))
 
 
 def _from_mapping(data: Any) -> SessionBundle:
@@ -65,13 +103,14 @@ def _from_mapping(data: Any) -> SessionBundle:
     else:
         inner = SessionBundle(access_token="")
     token = _first_string(data, ("accessToken", "access_token", "token", "at")) or inner.access_token
-    if not token and isinstance(data.get("user"), dict):
-        token = _first_string(data["user"], ("accessToken", "access_token", "token"))
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    if not token:
+        token = _first_string(user, ("accessToken", "access_token", "token"))
     cookies = dict(inner.cookies)
     cookies.update(_cookies_of(data))
     session_token = (
         _first_string(data, ("sessionToken", "session_token", "__Secure-next-auth.session-token"))
-        or cookies.get("__Secure-next-auth.session-token")
+        or session_token_from_cookies(cookies)
         or inner.session_token
     )
     device_id = (
@@ -93,8 +132,7 @@ def _from_mapping(data: Any) -> SessionBundle:
         token = nested.strip()
     if not token:
         raise ValueError("JSON 中没有 accessToken")
-    if session_token:
-        cookies.setdefault("__Secure-next-auth.session-token", session_token)
+    cookies = session_cookie_values(session_token, cookies)
     if device_id:
         cookies.setdefault("oai-did", device_id)
     return SessionBundle(
@@ -103,6 +141,8 @@ def _from_mapping(data: Any) -> SessionBundle:
         device_id=device_id,
         oai_session_id=session_id,
         cookies=cookies,
+        email=(email_from_access_token(token) or _first_string(user, ("email",))
+               or _first_string(data, ("email",)) or inner.email),
     )
 
 

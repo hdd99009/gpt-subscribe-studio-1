@@ -19,7 +19,13 @@ from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.money import quote_from_payload
 from gss_core.redaction import redact_sensitive
 from gss_core.sentinel import extract_attestation, extract_build, header_value, mint, so_header_value
-from gss_core.session_token import SessionBundle, parse_session_bundle
+from gss_core.session_token import (
+    SESSION_COOKIE_NAME,
+    SessionBundle,
+    parse_session_bundle,
+    session_cookie_values,
+    session_token_from_cookies,
+)
 
 APP_BASE = "https://chatgpt.com"
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
@@ -422,17 +428,20 @@ class CheckoutSession:
     quote_error: str = ""
 
 
-def jwt_account_id(access_token: str) -> str:
+def _jwt_payload(access_token: str) -> Dict[str, Any]:
     parts = str(access_token or "").split(".")
     if len(parts) < 2:
-        return ""
+        return {}
     try:
         padded = parts[1] + ("=" * (-len(parts[1]) % 4))
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
     except (ValueError, TypeError, json.JSONDecodeError):
-        return ""
-    if not isinstance(payload, dict):
-        return ""
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def jwt_account_id(access_token: str) -> str:
+    payload = _jwt_payload(access_token)
     auth = payload.get("https://api.openai.com/auth")
     if isinstance(auth, dict):
         value = auth.get("chatgpt_account_id")
@@ -481,6 +490,7 @@ class ChatGPTClient:
     _stripe_http: Any = field(default=None, repr=False)
     _stripe_js_id: str = field(default="", repr=False)
     _elements_session_id: str = field(default="", repr=False)
+    stripe_direct: bool = False
 
     @classmethod
     def from_raw_session(cls, raw: str, proxy: Optional[str] = None) -> "ChatGPTClient":
@@ -501,9 +511,7 @@ class ChatGPTClient:
         )
 
     def _cookie_header(self) -> str:
-        values: Dict[str, str] = dict(self.extra_cookies)
-        if self.session_token:
-            values.setdefault("__Secure-next-auth.session-token", self.session_token)
+        values = session_cookie_values(self.session_token, self.extra_cookies)
         if self.device_id:
             values["oai-did"] = self.device_id
         return "; ".join(f"{name}={value}" for name, value in values.items() if name and value is not None)
@@ -576,6 +584,13 @@ class ChatGPTClient:
         }
         if route.startswith("/backend-api/payments/"):
             headers.update(_CODEX_WEB_HEADERS)
+        if route in ("/backend-api/subscriptions", "/backend-api/subscriptions/cancel"):
+            headers.update(self._identity_headers())
+            for name in ("originator", "x-openai-web-frontend", "x-openai-codex-window-type"):
+                headers[name] = _CODEX_WEB_HEADERS[name]
+            return headers
+        if route == "/api/auth/session":
+            return headers
         if route.startswith("/backend-api/payments/") and self.attestation:
             headers["oai-web-deployment-attestation"] = self.attestation
             headers["OAI-Web-Deployment-Attestation"] = self.attestation
@@ -587,32 +602,57 @@ class ChatGPTClient:
             headers["OpenAI-Sentinel-SO-Token"] = self.sentinel_so
         return headers
 
-    def _merge_cookies(self) -> None:
+    def _merge_cookies(self, response: Any = None, *, session_token: str = "") -> None:
         jar = getattr(self.http, "cookies", None)
-        if jar is None:
+        response_jar = getattr(response, "cookies", None)
+        if jar is None and response_jar is None and not session_token:
             return
         gathered: Dict[str, str] = {}
-        try:
-            getter = getattr(jar, "get_dict", None)
-            if callable(getter):
-                gathered.update(getter() or {})
-                for domain in ("chatgpt.com", ".chatgpt.com"):
-                    try:
-                        gathered.update(getter(domain=domain) or {})
-                    except TypeError:
-                        break
-                    except Exception:
-                        continue
-            elif hasattr(jar, "items"):
-                gathered.update({str(k): str(v) for k, v in jar.items()})
-        except Exception:
-            gathered = {}
+        renewed_session = ""
+        for source in (jar, response_jar):
+            current: Dict[str, str] = {}
+            try:
+                getter = getattr(source, "get_dict", None)
+                if callable(getter):
+                    current.update(getter() or {})
+                    for domain in ("chatgpt.com", ".chatgpt.com"):
+                        try:
+                            current.update(getter(domain=domain) or {})
+                        except TypeError:
+                            break
+                        except Exception:
+                            continue
+                elif hasattr(source, "items"):
+                    current.update({str(k): str(v) for k, v in source.items()})
+            except Exception:
+                current = {}
+            gathered.update(current)
+            candidate = session_token_from_cookies(current)
+            if source is jar:
+                renewed_session = session_token or candidate
+            elif candidate:
+                renewed_session = candidate
         for name, value in gathered.items():
             if name and value is not None:
                 self.extra_cookies[str(name)] = str(value)
+        if renewed_session:
+            self.session_token = str(renewed_session)
+            self.extra_cookies = session_cookie_values(self.session_token, self.extra_cookies)
+            # Remove old base/chunk cookies from every domain before installing the rotation.
+            if jar is not None:
+                for name in list(jar):
+                    if name == SESSION_COOKIE_NAME or name.startswith(SESSION_COOKIE_NAME + "."):
+                        del jar[name]
+                cookies = session_cookie_values(self.session_token)
+                setter = getattr(jar, "set", None)
+                if callable(setter):
+                    for name, value in cookies.items():
+                        setter(name, value, domain="chatgpt.com", secure=True)
+                else:
+                    jar.update(cookies)
         self.http.headers.update(self._identity_headers())
 
-    def refresh_session(self) -> bool:
+    def refresh_session(self, *, failed_path: str = "", failed_method: str = "GET") -> bool:
         """用当前出口 IP 请求 /api/auth/session，换取与本批次出口一致的 accessToken 与 cookie。
 
         结账地区由出口代理决定（align_proxy_region），session 本身不绑定国家；
@@ -621,31 +661,69 @@ class ChatGPTClient:
 
         软失败：session-token 缺失/失效、上游报错都返回 False，调用方沿用原
         session 继续，不阻断结账。刷新结果只在内存，不落库。
+
+        鉴权拒绝后的恢复携带 refresh=true 与旧令牌签发时间，按浏览器的
+        auth recovery 请求换取新令牌。普通会话读取可能仍返回已被拒绝的旧值。
         """
         if not self.session_token:
+            self.session_token = session_token_from_cookies(self.extra_cookies)
+        if not self.session_token:
             return False
+        headers = {
+            **self._route_headers("/api/auth/session"),
+            "Authorization": None,
+            "chatgpt-account-id": None,
+        }
+        params = None
+        if failed_path:
+            params = {
+                "refresh": "true",
+                "reason": "token_expired",
+                "method": failed_method.upper(),
+                "path": failed_path,
+            }
+            headers.update({
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "x-codex-auth-recovery-attempt": str(uuid.uuid4()),
+                "x-codex-auth-recovery-document": self.oai_session_id or str(uuid.uuid4()),
+            })
+            issued_at = _jwt_payload(self.access_token).get("iat")
+            if type(issued_at) is int:
+                headers["x-openai-failed-access-token-iat"] = str(issued_at)
         try:
             response = self.http.get(
                 f"{APP_BASE}/api/auth/session",
-                headers=self._route_headers("/api/auth/session"),
+                params=params,
+                headers=headers,
                 timeout=self.timeout,
             )
         except Exception as exc:
             logger.warning("session 刷新失败（继续用原 session）: %s", redact_sensitive(str(exc))[:200])
             return False
+        payload = _json(response)
+        token = str(payload.get("accessToken") or "").strip()
+        recovered_account = jwt_account_id(token)
+        if failed_path and self.account_id and recovered_account and recovered_account != self.account_id:
+            logger.warning("session 恢复返回了不同账号，保留原订单凭证")
+            return False
+        refreshed_session = payload.get("sessionToken")
+        self._merge_cookies(response, session_token=refreshed_session if isinstance(refreshed_session, str) else "")
         status = int(getattr(response, "status_code", 0) or 0)
         if status >= 400:
             logger.warning("session 刷新失败（HTTP %s），继续用原 session", status)
             return False
-        payload = _json(response)
-        token = str(payload.get("accessToken") or "").strip()
         if not token:
             # session-token 已失效时上游返回 200 + 空 accessToken。
             logger.warning("session 刷新未返回 accessToken（session-token 可能已失效），继续用原 session")
             return False
+        changed = token != self.access_token
+        if failed_path and not changed:
+            logger.warning("session 恢复仍返回已被拒绝的访问令牌")
+            return False
         self.access_token = token
-        self._merge_cookies()
-        logger.info("session 刷新成功，已与本批次出口对齐")
+        self.http.headers.update(self._identity_headers())
+        logger.info("session 刷新完成 recovery=%s access_token_changed=%s", bool(failed_path), changed)
         return True
 
     def warmup(self, *, page_url: str = "") -> None:
@@ -672,7 +750,7 @@ class ChatGPTClient:
         attestation = extract_attestation(html)
         if attestation:
             self.attestation = attestation
-        self._merge_cookies()
+        self._merge_cookies(home)
 
     def mint_sentinel(self, *, flow: str, page_url: str = "") -> None:
         token = mint(
@@ -719,9 +797,7 @@ class ChatGPTClient:
             jar = getattr(self._http, "cookies", None)
             setter = getattr(jar, "set", None) if jar is not None else None
             if callable(setter):
-                cookies = dict(self.extra_cookies)
-                if self.session_token:
-                    cookies.setdefault("__Secure-next-auth.session-token", self.session_token)
+                cookies = session_cookie_values(self.session_token, self.extra_cookies)
                 if self.device_id:
                     cookies["oai-did"] = self.device_id
                 for name, value in cookies.items():
@@ -742,7 +818,11 @@ class ChatGPTClient:
     @property
     def stripe_http(self):
         if self._stripe_http is None:
-            self._stripe_http = _new_session(proxy=self.proxy, timeout=self.timeout)
+            proxy = None if self.stripe_direct else self.proxy
+            self._stripe_http = _new_session(proxy=proxy, timeout=self.timeout)
+            if self.stripe_direct:
+                # Empty explicit proxies also disable libcurl's environment proxy fallback.
+                self._stripe_http.proxies = {"http": "", "https": ""}
             self._stripe_http.headers.update(
                 {
                     "User-Agent": self.ua,
@@ -1804,18 +1884,92 @@ class ChatGPTClient:
     def subscription_payload(self) -> Dict[str, Any]:
         if not self.account_id:
             self.hydrate()
-        response = self.http.get(
-            f"{APP_BASE}/backend-api/subscriptions",
-            # 上游现已要求显式 account_id，否则 400 "must specify either organization_id or account_id"。
-            params={"account_id": self.account_id} if self.account_id else None,
-            headers=self._route_headers("/backend-api/subscriptions"),
-            timeout=self.timeout,
-        )
+        for attempt in range(2):
+            response = self.http.get(
+                f"{APP_BASE}/backend-api/subscriptions",
+                params={"account_id": self.account_id} if self.account_id else None,
+                headers=self._route_headers("/backend-api/subscriptions"),
+                timeout=self.timeout,
+            )
+            self._merge_cookies(response)
+            if int(getattr(response, "status_code", 0) or 0) != 401 or attempt or not self.refresh_session(
+                failed_path="/backend-api/subscriptions",
+            ):
+                break
         if int(getattr(response, "status_code", 0) or 0) == 401:
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if int(getattr(response, "status_code", 0) or 0) >= 400:
             self._raise(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, response, "查询订阅")
         return _json(response)
+
+    def cancel_subscription_renewal(self, *, expected_plan: str) -> Dict[str, Any]:
+        """Cancel renewal once, then reconcile against the subscription itself."""
+        for attempt in range(3):
+            before = self.subscription_payload()
+            try:
+                will_renew = _subscription_will_renew(before, expected_plan)
+                break
+            except DomainError as exc:
+                if not exc.detail.get("activation_pending") or attempt == 2:
+                    raise
+                time.sleep(1)
+        if not will_renew:
+            return {"will_renew": False, "already_cancelled": True}
+        if not self.account_id:
+            raise DomainError(ErrorCode.INVALID_SESSION, "无法确定取消续费的账户")
+        path = "/backend-api/subscriptions/cancel"
+        for attempt in range(2):
+            try:
+                response = self.http.post(
+                    f"{APP_BASE}{path}",
+                    json={"account_id": self.account_id},
+                    headers=self._route_headers(path),
+                    timeout=self.timeout,
+                )
+                self._merge_cookies(response)
+            except Exception:  # The cancellation may have reached the server.
+                response = None
+                break
+            if int(getattr(response, "status_code", 0) or 0) != 401 or attempt or not self.refresh_session(
+                failed_path=path, failed_method="POST",
+            ):
+                break
+        if response is not None:
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status == 401:
+                raise DomainError(ErrorCode.INVALID_SESSION, "Session 已过期，请在 ChatGPT 账单设置中关闭自动续费")
+            if status >= 400:
+                raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, f"取消续费请求被拒绝（HTTP {status}）")
+        for attempt in range(3):
+            if attempt:
+                time.sleep(1)
+            try:
+                if not _subscription_will_renew(self.subscription_payload(), expected_plan):
+                    return {"will_renew": False, "already_cancelled": False}
+            except Exception:  # A follow-up query may briefly fail or lag behind.
+                continue
+        raise DomainError(
+            ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+            "取消续费结果尚未确认，请重试关闭自动续费或在 ChatGPT 账单设置中核实",
+        )
+
+
+def _subscription_will_renew(payload: Dict[str, Any], expected_plan: str) -> bool:
+    entitlement = payload.get("entitlement")
+    entitlement = entitlement if isinstance(entitlement, dict) else {}
+    plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
+    if _PLAN_TYPE.get(plan) != _PLAN_TYPE.get(expected_plan, expected_plan):
+        raise DomainError(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, "当前订阅套餐与订单不符，取消续费待核实",
+                          detail={"activation_pending": plan in {"free", "chatgptfreeplan"}})
+    if payload.get("is_active") is False or entitlement.get("has_active_subscription") is False:
+        raise DomainError(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, "付款已确认，等待订阅生效后关闭续费",
+                          detail={"activation_pending": True})
+    will_renew = payload.get("will_renew")
+    if will_renew is None and isinstance(payload.get("last_active_subscription"), dict):
+        will_renew = payload["last_active_subscription"].get("will_renew")
+    if not isinstance(will_renew, bool):
+        raise DomainError(ErrorCode.CHECKOUT_UPSTREAM_ERROR, "订阅查询缺少自动续费状态，请稍后重试取消续费")
+    return will_renew
 
 
 def _json(response: Any) -> Dict[str, Any]:

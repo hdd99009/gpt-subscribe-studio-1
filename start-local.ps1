@@ -19,9 +19,19 @@ $server = Start-Process -FilePath $pythonPath -ArgumentList @('-X', 'utf8', ('"'
     -RedirectStandardOutput (Join-Path $PSScriptRoot 'runtime/local/logs/server.out.log') `
     -RedirectStandardError (Join-Path $PSScriptRoot 'runtime/local/logs/server.err.log')
 [System.IO.File]::WriteAllText($pidPath, [string]$server.Id)
-$readyCode = 'import httpx,sys; response=httpx.get("https://127.0.0.1:18443/login", verify=False, trust_env=False, timeout=2); sys.exit(0 if response.status_code == 200 else 1)'
+$readyCode = @'
+import sys
+import httpx
+
+try:
+    response = httpx.get("https://127.0.0.1:18443/login", verify=False, trust_env=False, timeout=2)
+except httpx.HTTPError:
+    sys.exit(1)
+sys.exit(0 if response.status_code == 200 else 1)
+'@
 for ($attempt = 0; $attempt -lt 10; $attempt++) {
-    & $pythonPath -X utf8 -c $readyCode 2>$null
+    # Stdin preserves Python quotes in both Windows PowerShell 5.1 and PowerShell 7.
+    $readyCode | & $pythonPath -X utf8 -
     if ($LASTEXITCODE -eq 0) {
         Write-Output "Started local server (PID $($server.Id)): https://localhost:18443"
         Write-Output 'Login details: runtime/local/ACCESS.txt'

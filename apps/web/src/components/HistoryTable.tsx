@@ -18,11 +18,13 @@ export function HistoryTable({ items }: { items: HistoryRecord[] }) {
       <Text size="xs" c="dimmed" mb="xs">
         记录仅保存在当前浏览器，最多 50 条。
       </Text>
-      <Table.ScrollContainer minWidth={640}>
+      <Table.ScrollContainer minWidth={900}>
         <Table verticalSpacing="sm" highlightOnHover>
           <Table.Thead>
             <Table.Tr>
               <Table.Th>状态</Table.Th>
+              <Table.Th>邮箱</Table.Th>
+              <Table.Th>卡号后4位</Table.Th>
               <Table.Th>套餐</Table.Th>
               <Table.Th>地区</Table.Th>
               <Table.Th>金额</Table.Th>
@@ -50,6 +52,8 @@ export function HistoryTable({ items }: { items: HistoryRecord[] }) {
                       </Text>
                     )}
                   </Table.Td>
+                  <Table.Td>{item.email || "—"}</Table.Td>
+                  <Table.Td><Code>{item.card_last4 || "—"}</Code></Table.Td>
                   <Table.Td>{planLabel(item.plan)}</Table.Td>
                   <Table.Td>{regionLabel(item.country)}</Table.Td>
                   <Table.Td>{formatAmount(item.amount, item.currency) ?? "-"}</Table.Td>

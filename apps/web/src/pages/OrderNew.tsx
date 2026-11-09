@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   createOrder,
   checkPromoEligibility,
+  checkSession,
   getOrder,
   isHostedOrder,
   payOrder,
@@ -17,6 +18,7 @@ import {
   type Order,
   type Plan,
   type PromoEligibility,
+  type SessionInspection,
 } from "../api/client";
 import { SUCCESS_STATUSES, isSettled } from "../api/history";
 import { subscribeOrderUpdates, type OrderUpdateEvent } from "../api/events";
@@ -30,6 +32,7 @@ import { CheckoutLinkCard } from "../components/CheckoutLinkCard";
 import { emptyTeamCard, type TeamCardDraft } from "../card-payment/TeamCardForm";
 import { BillingForm } from "../components/BillingForm";
 import { protocolBillingError } from "../card-payment/protocolBind";
+import { planLabel } from "../plans";
 
 interface Props {
   onRecord: (order: Order) => void;
@@ -39,6 +42,9 @@ export function OrderNew({ onRecord }: Props) {
   const [plan, setPlan] = useState<Plan>("plus");
   const [country, setCountry] = useState("");
   const [session, setSession] = useState("");
+  const [sessionInspection, setSessionInspection] = useState<SessionInspection | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [checkingSession, setCheckingSession] = useState(false);
   const [checkoutBilling, setCheckoutBilling] = useState<BillingInput>({
     name: "", email: "", line1: "", city: "", state: "", postal_code: "", country: "",
   });
@@ -83,7 +89,7 @@ export function OrderNew({ onRecord }: Props) {
   }
 
   function reset() {
-    if (busy || protocolBusy) return;
+    if (busy || checkingSession || protocolBusy) return;
     setOrder(null);
     setResult(null);
     setCard(null);
@@ -91,6 +97,8 @@ export function OrderNew({ onRecord }: Props) {
     setTeamBilling({ name: "", line1: "", city: "", state: "", postal_code: "", country: "US" });
     setAddr(null);
     setSession("");
+    setSessionInspection(null);
+    setSessionError(null);
     setCheckoutBilling({ name: "", email: "", line1: "", city: "", state: "", postal_code: "", country: "" });
     setError(null);
     setPromo(null);
@@ -215,9 +223,47 @@ export function OrderNew({ onRecord }: Props) {
     return () => { stopped = true; window.clearTimeout(timer); };
   }, [teamPendingId, onRecord]);
 
+  const renewalPendingId = result?.renewal?.status === "pending" ? result.id : "";
+  useEffect(() => {
+    if (!renewalPendingId) return;
+    let stopped = false;
+    let timer: number | undefined;
+    const update = async () => {
+      try {
+        const latest = await getOrder(renewalPendingId);
+        if (stopped) return;
+        setResult(latest);
+        if (latest.renewal?.status !== "pending") { onRecord(latest); return; }
+      } catch { /* A cancellation status query can be retried without another payment. */ }
+      if (!stopped) timer = window.setTimeout(update, 2000);
+    };
+    timer = window.setTimeout(update, 2000);
+    return () => { stopped = true; window.clearTimeout(timer); };
+  }, [renewalPendingId, onRecord]);
+
+  async function inspectSession() {
+    if (busy || checkingSession || !session.trim()) return;
+    setCheckingSession(true);
+    setSessionInspection(null);
+    setSessionError(null);
+    try {
+      const inspected = await checkSession(session.trim());
+      setSessionInspection(inspected);
+      setSession(inspected.session);
+      if (inspected.email) {
+        setCheckoutBilling((previous) => ({ ...previous, email: inspected.email || "" }));
+        setTeamBilling((previous) => ({ ...previous, email: inspected.email || "" }));
+      }
+    } catch (err) {
+      setSessionError(err instanceof Error ? err.message : "Session 检测失败，请重试");
+    } finally {
+      setCheckingSession(false);
+    }
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (busy || protocolBusy || order?.plan === "plus") return;
+    if (busy || checkingSession || protocolBusy || order?.plan === "plus") return;
     setError(null);
     setBusy(true);
     try {
@@ -261,6 +307,7 @@ export function OrderNew({ onRecord }: Props) {
         setOrder(created);
         if (plan !== "team") {
           setAddr({
+            email: created.billing?.email || created.session_email || "",
             name: created.billing?.name ?? "",
             line1: created.billing?.line1 ?? "",
             city: created.billing?.city ?? "",
@@ -270,6 +317,8 @@ export function OrderNew({ onRecord }: Props) {
           });
         }
         setSession("");
+        setSessionInspection(null);
+        setSessionError(null);
         if (plan === "team") {
           try {
             // 只要拿到 cs_ 就能 init 报价，与有没有 publishable_key 无关。
@@ -337,7 +386,7 @@ export function OrderNew({ onRecord }: Props) {
         token = await card!.tokenize(billing);
       }
       try {
-        finish(await payOrder(order.id, token, billing, teamConfirm));
+        finish(await payOrder(order.id, token, billing, teamConfirm, card?.last4 || undefined));
       } catch (err) {
         const message = err instanceof Error ? err.message : "开通失败";
         const latest = await getOrder(order.id).catch(() => order);
@@ -367,7 +416,7 @@ export function OrderNew({ onRecord }: Props) {
   const primaryAction = step < 2 && !protocolStep ? (
     <Group mt={teamOrder ? "xs" : "md"} justify="flex-end">
       <Button type="submit" size="md" loading={busy}
-        disabled={Boolean(order && !linkOnly && !teamOrder && !card)} fullWidth={teamOrder}>
+        disabled={checkingSession || Boolean(order && !linkOnly && !teamOrder && !card)} fullWidth={teamOrder}>
         {!order
           ? plan === "team" ? `生成 Team 结账链接（${team.seats} 席）` : "创建结账"
           : linkOnly ? "我已支付，查询订阅" : "确认支付"}
@@ -390,7 +439,28 @@ export function OrderNew({ onRecord }: Props) {
 
           {step === 0 && (
             <Stack gap={teamOrder ? "md" : "lg"}>
-              <SessionField value={session} onChange={setSession} team={plan === "team"} disabled={busy} />
+              <Stack gap="xs">
+                <SessionField value={session} onChange={(value) => {
+                  setSession(value);
+                  setSessionInspection(null);
+                  setSessionError(null);
+                }} team={plan === "team"} disabled={busy || checkingSession} />
+                <Group>
+                  <Button type="button" variant="light" loading={checkingSession}
+                    disabled={busy || !session.trim()} onClick={() => void inspectSession()}>
+                    检测 Session 与会员状态
+                  </Button>
+                </Group>
+                {sessionInspection && (
+                  <Alert color="green" title="Session 有效" data-testid="session-inspection">
+                    <Text size="sm">邮箱 {sessionInspection.email || "未解析到邮箱"}</Text>
+                    <Text size="sm">当前套餐 {sessionInspection.plan_type === "free" ? "免费用户" : sessionInspection.plan_type === "guest" ? "访客" : planLabel(sessionInspection.plan_type)} · {sessionInspection.active ? "会员有效" : "当前无有效付费会员"}</Text>
+                    {sessionInspection.expires_at && <Text size="sm">到期时间 {new Date(sessionInspection.expires_at).toLocaleString()}</Text>}
+                    {typeof sessionInspection.will_renew === "boolean" && <Text size="sm">自动续费 {sessionInspection.will_renew ? "已开启" : "已关闭"}</Text>}
+                  </Alert>
+                )}
+                {sessionError && <Alert color="red" title="Session 检测失败" role="alert">{sessionError}</Alert>}
+              </Stack>
               <PlanPicker
                 compact={teamOrder}
                 plan={plan}
@@ -417,10 +487,10 @@ export function OrderNew({ onRecord }: Props) {
                 <Paper withBorder p="md" radius="md" data-testid="checkout-billing-form">
                   <Stack gap="sm">
                     <Text fw={600}>账单地址（创建结账前填写）</Text>
-                    <Text size="sm" c="dimmed">填写付款人的真实账单地址。创建结账时会提交这份地址核算税费，取得报价后再填写卡片和确认付款。</Text>
-                    <TextInput label="账单邮箱" type="email" value={checkoutBilling.email || ""} autoComplete="email" disabled={busy}
+                    <Text size="sm" c="dimmed">可手动填写账单地址，或一键生成美国免税州示例地址。创建结账时会提交这份地址核算税费，取得报价后再填写卡片和确认付款；使用真实卡时请填写发卡行登记的地址。</Text>
+                    <TextInput label="账单邮箱" type="email" value={checkoutBilling.email || ""} autoComplete="email" disabled={busy || checkingSession}
                       onChange={(event) => setCheckoutBilling({ ...checkoutBilling, email: event.currentTarget.value })} />
-                    <BillingForm independentCountry compact value={checkoutBilling} onChange={setCheckoutBilling} disabled={busy} />
+                    <BillingForm independentCountry compact randomize value={checkoutBilling} onChange={setCheckoutBilling} disabled={busy} />
                   </Stack>
                 </Paper>
               )}
@@ -534,7 +604,12 @@ export function OrderNew({ onRecord }: Props) {
 
 
 
-          {step === 2 && result && <ResultPanel order={result} protocolOnly={result.plan === "plus" && pmMode === "server"} onReset={reset} />}
+          {step === 2 && result && <ResultPanel order={result} protocolOnly={result.plan === "plus" && pmMode === "server"} onReset={reset}
+            onOrderChange={(latest) => {
+              if (latest.id !== currentOrderId.current) return;
+              setResult(latest);
+              onRecord(latest);
+            }} />}
 
           {errorAlert}
           {primaryAction}
@@ -589,7 +664,7 @@ export function OrderNew({ onRecord }: Props) {
                     const latest = out.order || await getOrder(order.id).catch(() => null);
                     if (!latest || latest.id !== currentOrderId.current) return;
                     setOrder((current) => current?.id === latest.id ? latest : current);
-                    if (latest.subscription?.active || SUCCESS_STATUSES.includes(latest.status)
+                    if (latest.payment_confirmed || latest.subscription?.active || SUCCESS_STATUSES.includes(latest.status)
                       || ((latest.plan !== "plus" || pmMode === "stripe") && isSettled(latest.status))
                        || (latest.plan === "plus" && pmMode === "stripe" && latest.status !== "awaiting_payment")) finish(latest);
                   })();

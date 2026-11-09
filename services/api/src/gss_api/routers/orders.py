@@ -36,12 +36,10 @@ from gss_core.proxies import align_proxy_region, configured_proxy, session_proxy
 from gss_core.redaction import redact_sensitive
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats, _processor_from_checkout_url
 from gss_core.session_token import (
-    email_from_access_token,
-    parse_session,
     parse_session_bundle,
 )
 from gss_core.vault import OrderSecrets, vault
-from gss_core.saved_cards import verification_session
+from gss_core.saved_cards import session_snapshot, verification_session
 from gss_orchestrator.pipeline import apply_payment_result, assert_deliverable
 from gss_payment.adapter import hosted_payment_result
 
@@ -64,6 +62,7 @@ from .events import notify_order_update
 router = APIRouter(prefix="/api", tags=["orders"])
 logger = logging.getLogger("gss.orders")
 _team_locks: dict[str, asyncio.Lock] = {}
+_renewal_tasks: dict[str, asyncio.Task] = {}
 
 
 def _assert_saved_card_resolved(secrets: OrderSecrets) -> None:
@@ -103,14 +102,15 @@ def _to_out(order: Order) -> OrderOut:
             expires_at=view.subscription.expires_at.isoformat() if view.subscription.expires_at else None,
             channel=view.subscription.channel,
         )
-    # 账户邮箱：从 vault 里的 accessToken 现解一次，失败留空由前端兜底
-    session_email = ""
+    # 账号邮箱随订单保留，凭证清理后仍可用于展示开通记录。
+    session_email = view.session_email or ""
     try:
         _sec = vault.get(order.id)
         if _sec and _sec.session:
-            session_email = email_from_access_token(parse_session(_sec.session))
+            session_email = parse_session_bundle(_sec.session).email or session_email
     except Exception:
-        session_email = ""
+        pass
+    view.session_email = session_email or None
 
     return OrderOut(
         id=order.id,
@@ -133,6 +133,8 @@ def _to_out(order: Order) -> OrderOut:
         quote_error=view.quote_error,
         next_action=view.next_action,
         subscription=subscription,
+        payment_confirmed=view.payment_confirmed,
+        renewal=view.renewal,
         checkout_kind=view.checkout_kind,
         seat_quantity=view.seat_quantity,
         workspace_name=view.workspace_name,
@@ -141,6 +143,7 @@ def _to_out(order: Order) -> OrderOut:
         price_interval=view.price_interval,
         confirm_return_url=view.confirm_return_url,
         session_email=session_email or None,
+        card_last4=view.card_last4,
     )
 
 
@@ -318,6 +321,7 @@ async def create_order(
         status=OrderStatus.CREATED,
     )
     store.create_order(order, idempotency_key)
+    store.view(order.id).session_email = bundle.email or None
     store.add_job(Job(order_id=order.id, stage="checkout"))
     # 指纹 profile：与建单 client 用同一个 device_id 推导，保证全程一致
     try:
@@ -453,8 +457,8 @@ async def refresh_checkout_quote(order_id: str) -> OrderOut:
         return _to_out(order)
 
 
-async def _mark_delivered(order_id: str) -> None:
-    """扣款成功后直接推进到 delivered，并清掉内存里的 session。"""
+async def _mark_delivered(order_id: str, *, renewal_checked: bool = False) -> None:
+    """Deliver the paid order and close renewal before releasing its session."""
     current = store.get_order(order_id)
     if current is not None and current.status is OrderStatus.VERIFYING:
         store.update_status(order_id, OrderStatus.ACTIVE)
@@ -463,8 +467,108 @@ async def _mark_delivered(order_id: str) -> None:
         store.update_status(order_id, OrderStatus.DELIVERED)
     store.view(order_id).last_error = None
     store.view(order_id).next_action = None
-    vault.drop(order_id)
-    await notify_order_update(order_id, OrderStatus.DELIVERED, {"payment_confirmed": True})
+    if use_fake_adapters():
+        vault.drop(order_id)
+    elif renewal_checked:
+        if (store.view(order_id).renewal or {}).get("status") == "cancelled":
+            vault.drop(order_id)
+        else:
+            secrets = vault.get(order_id)
+            if secrets:
+                vault.put(order_id, OrderSecrets(session=secrets.session, account_id=secrets.account_id,
+                    proxy=secrets.proxy, expires_at=secrets.expires_at))
+    else:
+        await _cancel_order_renewal(order_id)
+    event = {"payment_confirmed": True}
+    if store.view(order_id).subscription is not None:
+        event["subscription_active"] = store.view(order_id).subscription.active
+    await notify_order_update(order_id, OrderStatus.DELIVERED, event)
+
+
+def _cancel_renewal(secrets: OrderSecrets, plan: str, *, client=None) -> dict:
+    owned = client is None
+    try:
+        if owned:
+            client = _team_client(secrets)
+        client.timeout = 10.0
+        if secrets.account_id:
+            client.account_id = secrets.account_id
+        if not getattr(client, "access_token", "") and getattr(client, "session_token", ""):
+            client.refresh_session()
+        result = client.cancel_subscription_renewal(expected_plan=plan)
+        return {"status": "cancelled", "message": "自动续费已关闭，当前周期权益保留至到期", **result}
+    except Exception as exc:
+        retryable = not isinstance(exc, DomainError) or exc.code not in {
+            ErrorCode.INVALID_SESSION, ErrorCode.SESSION_EXPIRED,
+        }
+        message = redact_sensitive(exc.message)[:240] if isinstance(exc, DomainError) else "取消续费结果暂未确认，请重试关闭自动续费"
+        return {"status": "failed", "message": message, "retryable": retryable}
+    finally:
+        if owned and client is not None:
+            if hasattr(client, "access_token"):
+                secrets.session = session_snapshot(client)
+            client.close()
+
+
+async def _finish_renewal(order_id: str, secrets: OrderSecrets, plan: str) -> None:
+    view = store.view(order_id)
+    try:
+        view.renewal = await asyncio.to_thread(_cancel_renewal, secrets, plan)
+        order = store.get_order(order_id)
+        if view.renewal["status"] == "cancelled":
+            if order and view.payment_confirmed and order.status is OrderStatus.VERIFYING:
+                store.update_status(order_id, OrderStatus.ACTIVE)
+                store.update_status(order_id, OrderStatus.DELIVERED)
+            vault.drop(order_id)
+        logger.info("renewal_result id=%s status=%s", order_id, view.renewal["status"])
+        if order:
+            await notify_order_update(order_id, order.status, {"renewal": view.renewal})
+    finally:
+        _renewal_tasks.pop(order_id, None)
+
+
+async def _cancel_order_renewal(order_id: str) -> None:
+    view = store.view(order_id)
+    if view.renewal and view.renewal.get("status") == "cancelled":
+        return
+    task = _renewal_tasks.get(order_id)
+    if task is None:
+        secrets = vault.get(order_id)
+        if secrets is None:
+            view.renewal = {"status": "failed", "message": "订单凭证已过期，请登录 ChatGPT 在账单设置中关闭自动续费"}
+            return
+        # Only the credentials needed for a cancellation retry survive delivery.
+        secrets = OrderSecrets(session=secrets.session, account_id=secrets.account_id,
+                               proxy=secrets.proxy, expires_at=secrets.expires_at)
+        vault.put(order_id, secrets)
+        view.renewal = {"status": "pending", "message": "支付成功，正在关闭自动续费"}
+        task = asyncio.create_task(_finish_renewal(order_id, secrets, str(store.get_order(order_id).plan)))
+        _renewal_tasks[order_id] = task
+    # Keep the task alive across HTTP timeouts, with at most one worker per order.
+    await asyncio.wait({task}, timeout=5)
+    if task.done():
+        task.result()
+
+
+@router.post("/orders/{order_id}/cancel-renewal", response_model=OrderOut)
+async def cancel_order_renewal(order_id: str) -> OrderOut:
+    async with _team_locks.setdefault(order_id, asyncio.Lock()):
+        order = store.get_order(order_id)
+        if order is None:
+            raise HTTPException(404, "订单不存在")
+        if order.status not in {OrderStatus.ACTIVE, OrderStatus.DELIVERED} and not (
+            order.status is OrderStatus.VERIFYING and store.view(order_id).payment_confirmed
+        ):
+            raise HTTPException(409, "请先确认订单付款成功")
+        if use_fake_adapters():
+            raise HTTPException(409, "离线模式无法取消真实订阅续费")
+        secrets = vault.get(order_id)
+        operation = (secrets.saved_card_context or {}).get("operation_task") if secrets else None
+        if operation is not None and not operation.done():
+            await asyncio.wait({operation}, timeout=5)
+            return _to_out(order)
+        await _cancel_order_renewal(order_id)
+        return _to_out(order)
 
 
 def _team_client(secrets: OrderSecrets, country: str = "") -> ChatGPTClient:
@@ -711,6 +815,15 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     if secrets is None:
         raise _error(status.HTTP_401_UNAUTHORIZED, ErrorCode.SESSION_EXPIRED, "session 已过期，请重新提交")
     _assert_saved_card_resolved(secrets)
+    view = store.view(order_id)
+    if payload.card is not None:
+        view.card_last4 = payload.card.last4
+    else:
+        saved = secrets.saved_card_context or {}
+        saved_card = saved.get("card") or {}
+        view.card_last4 = payload.card_last4 or (
+            (saved_card.get("last4") or None) if payload.payment_method_token == saved.get("payment_method_id") else None
+        )
 
     if order.plan is Plan.TEAM and not use_fake_adapters():
         context = secrets.team_context
@@ -767,7 +880,6 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         secrets.billing = custom
         vault.put(order_id, secrets)
 
-    view = store.view(order_id)
     if payload.billing is not None:
         view.billing = dict(secrets.billing)
     pipeline = build_pipeline()
@@ -881,10 +993,7 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
                 store.update_status(order_id, OrderStatus.VERIFYING)
             store.update_status(order_id, OrderStatus.ACTIVE)
             assert_deliverable(OrderStatus.ACTIVE, info)
-            store.update_status(order_id, OrderStatus.DELIVERED)
-            view.last_error = None
-            vault.drop(order_id)
-            await notify_order_update(order_id, OrderStatus.DELIVERED, {"subscription_active": True})
+            await _mark_delivered(order_id)
         else:
             view.last_error = "订阅尚未生效，请在新结账页面完成付款后重新查询"
         return _to_out(order)
@@ -911,11 +1020,7 @@ async def _verify_order(order_id: str, paid: bool = False) -> OrderOut:
     if info.active:
         store.update_status(order_id, OrderStatus.ACTIVE)
         assert_deliverable(OrderStatus.ACTIVE, info)
-        store.update_status(order_id, OrderStatus.DELIVERED)
-        view.last_error = None
-        vault.drop(order_id)
-        # SSE 通知：订阅激活并交付
-        await notify_order_update(order_id, OrderStatus.DELIVERED, {"subscription_active": True})
+        await _mark_delivered(order_id)
     elif paid:
         await _mark_delivered(order_id)
     else:
@@ -958,6 +1063,7 @@ class ProtocolPayRequest(BaseModel):
     """
     card: Optional[CardIn] = None
     payment_method_id: Optional[str] = Field(default=None, max_length=80)
+    card_last4: Optional[str] = Field(default=None, pattern=r"^\d{4}$")
     billing: BillingIn
     proxy: Optional[str] = Field(default=None, max_length=300)
     publishable_key: Optional[str] = Field(default=None, max_length=120)
@@ -988,6 +1094,7 @@ class ProtocolPayOut(BaseModel):
     intent_status: Optional[str] = None
     charge_id: Optional[str] = None
     payment_method_id: Optional[str] = None
+    order: Optional[OrderOut] = None
 
 
 @router.post(
@@ -1043,6 +1150,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
 
     pm_id = resolve_protocol_payment_method(payload)
     card = payload.card.model_dump() if payload.card else {}
+    view.card_last4 = payload.card.last4 if payload.card else payload.card_last4
     billing = {k: (v or "").strip() for k, v in payload.billing.model_dump().items()}
     billing["country"] = (billing.get("country") or "US").upper()
 
@@ -1117,10 +1225,15 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         "protocol_pay id=%s state=%s decline=%s code=%s",
         order_id, outcome.state, outcome.decline_code, outcome.code,
     )
+    if outcome.state == "paid":
+        store.update_status(order_id, OrderStatus.PAYING)
+        store.update_status(order_id, OrderStatus.VERIFYING)
+        await _mark_delivered(order_id)
     return ProtocolPayOut(
         state=outcome.state, code=outcome.code,
         decline_code=outcome.decline_code, message=outcome.message,
         intent_status=outcome.intent_status, charge_id=outcome.charge_id,
         payment_method_id=outcome.payment_method_id,
+        order=_to_out(order),
     )
 

@@ -5,6 +5,7 @@ import {
   bindAndPayProtocol,
   formatAmount,
   getBindAndPayProtocol,
+  getOrder,
   type BindAndPayProtocolInput,
   type BindAndPayProtocolResult,
   type BillingInput,
@@ -43,9 +44,10 @@ export function PlusProtocolPayPanel({
   const [needsQuery, setNeedsQuery] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [quoteConfirmed, setQuoteConfirmed] = useState(false);
+  const [stripeDirect, setStripeDirect] = useState(false);
   const busyRef = useRef(false);
   const epoch = useRef(0);
-  const submittedDetails = useRef<Pick<BindAndPayProtocolInput, "card" | "billing"> | null>(null);
+  const submittedDetails = useRef<Pick<BindAndPayProtocolInput, "card" | "billing" | "stripe_direct"> | null>(null);
   const onBusyRef = useRef(onBusyChange);
   const onDoneRef = useRef(onDone);
   onBusyRef.current = onBusyChange;
@@ -55,6 +57,26 @@ export function PlusProtocolPayPanel({
     epoch.current += 1;
     return () => { epoch.current += 1; onBusyRef.current?.(false); };
   }, [orderId]);
+
+  useEffect(() => {
+    if (work !== "submit") return;
+    let stopped = false;
+    let timer: number | undefined;
+    const update = async () => {
+      try {
+        const latest = await getOrder(orderId);
+        if (stopped) return;
+        if (latest.payment_confirmed) {
+          onDoneRef.current?.({ state: ["active", "delivered"].includes(latest.status) ? "paid" : "pending",
+            stage: "payment", intent_status: "succeeded", payment_confirmed: true, order: latest });
+          return;
+        }
+      } catch { /* The local payment snapshot can be read again while the request runs. */ }
+      if (!stopped) timer = window.setTimeout(update, 1500);
+    };
+    timer = window.setTimeout(update, 1500);
+    return () => { stopped = true; window.clearTimeout(timer); };
+  }, [orderId, work]);
 
   const price = formatAmount(amount, currency);
   const hasQuote = amount != null && amount !== "" && Number.isFinite(Number(amount)) && Number(amount) >= 0 && Boolean(currency);
@@ -71,6 +93,9 @@ export function PlusProtocolPayPanel({
     if (out.state === "not_started") {
       setSubmitted(false);
       submittedDetails.current = null;
+    } else {
+      setSubmitted(true);
+      if (typeof out.stripe_direct === "boolean") setStripeDirect(out.stripe_direct);
     }
     onDoneRef.current?.(out);
   }
@@ -99,6 +124,7 @@ export function PlusProtocolPayPanel({
   function submitProtocol() {
     if (!canSubmit) return;
     const details = submittedDetails.current || {
+      stripe_direct: stripeDirect,
       card: { ...card, number: card.number.replace(/[\s-]/g, "") },
       billing: {
         ...billing,
@@ -213,6 +239,10 @@ export function PlusProtocolPayPanel({
           </Stack>
         </Alert>
       )}
+      <Checkbox label="Stripe 支付直连" checked={stripeDirect} disabled={fieldsDisabled}
+        description="勾选后，由运行本站的电脑直接连接 Stripe，ChatGPT 请求使用建单出口。首次提交后沿用本次选择。"
+        onChange={(event) => setStripeDirect(event.currentTarget.checked)} />
+      <Text size="sm" c="dimmed">付款成功后自动关闭续费，结果会显示在开通完成页。</Text>
       <Group justify="space-between">
         <Button type="button" variant="default" loading={work === "query"} disabled={disabled || work !== null} onClick={queryProtocol}>查询协议状态</Button>
         <Button type="button" loading={work === "submit"} disabled={!canSubmit} onClick={submitProtocol}>协议支付{price ? ` ${price}` : ""}</Button>

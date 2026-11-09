@@ -8,6 +8,8 @@ export interface HistoryRecord {
   currency?: string | null;
   status: string;
   error?: string | null;
+  email?: string | null;
+  card_last4?: string | null;
   at: number;
 }
 
@@ -53,6 +55,9 @@ export function loadHistory(): HistoryRecord[] {
 }
 
 export function recordOrder(order: Order): HistoryRecord[] {
+  const previous = loadHistory();
+  const existing = previous.find((item) => item.id === order.id);
+  const last4 = order.card_last4 || existing?.card_last4;
   const next: HistoryRecord = {
     id: order.id,
     plan: order.plan,
@@ -61,9 +66,11 @@ export function recordOrder(order: Order): HistoryRecord[] {
     currency: order.currency,
     status: order.status,
     error: normalizeHistoryError(order.last_error),
+    email: order.session_email || existing?.email || order.billing?.email || null,
+    card_last4: last4 && /^\d{4}$/.test(last4) ? last4 : null,
     at: Date.now(),
   };
-  const list = [next, ...loadHistory().filter((item) => item.id !== order.id)].slice(0, MAX);
+  const list = [next, ...previous.filter((item) => item.id !== order.id)].slice(0, MAX);
   try {
     localStorage.setItem(KEY, JSON.stringify(list));
   } catch {

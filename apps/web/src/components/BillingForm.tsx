@@ -1,6 +1,8 @@
-import { Select, SimpleGrid, Stack, Text, TextInput } from "@mantine/core";
+import { Button, Group, Select, SimpleGrid, Stack, Text, TextInput } from "@mantine/core";
+import { IconMapPin } from "@tabler/icons-react";
 
 import type { BillingInput } from "../api/client";
+import { randomBillingExample, TAX_FREE_STATE_LABEL } from "../card-payment/billingExamples";
 import { REGIONS } from "../plans";
 
 const US_STATES = (
@@ -22,9 +24,11 @@ interface Props {
   disabled?: boolean;
   independentCountry?: boolean;
   compact?: boolean;
+  /** Show a one-click US tax-free address generator. */
+  randomize?: boolean;
 }
 
-export function BillingForm({ value, onChange, disabled, independentCountry = false, compact = false }: Props) {
+export function BillingForm({ value, onChange, disabled, independentCountry = false, compact = false, randomize = false }: Props) {
   const set = (key: keyof BillingInput) => (event: React.ChangeEvent<HTMLInputElement>) =>
     onChange({ ...value, [key]: event.currentTarget.value });
   const billingCountry = independentCountry ? (
@@ -43,6 +47,19 @@ export function BillingForm({ value, onChange, disabled, independentCountry = fa
       <Text size={compact ? "xs" : "sm"} c="dimmed">
         {independentCountry ? "支付账单国家独立于创建结账地区；请填写实际地址，税费由 Stripe 计算。" : "下面是自动生成的示例地址。用自己的真实卡时，请改成发卡行登记的账单地址。"}
       </Text>
+      {randomize && (
+        <Group justify="space-between" gap="xs" wrap="wrap">
+          <Text size="xs" c="dimmed">
+            美国免税州：{TAX_FREE_STATE_LABEL}（真实城市与街道，邮编匹配）
+          </Text>
+          <Button type="button" size="xs" variant="light" leftSection={<IconMapPin size={14} />}
+            data-testid="random-tax-free-address"
+            disabled={disabled}
+            onClick={() => onChange(randomBillingExample(value))}>
+            随机免税州地址
+          </Button>
+        </Group>
+      )}
       {compact ? <SimpleGrid cols={{ base: 1, xs: 2 }}>{nameInput}{billingCountry}</SimpleGrid> : nameInput}
       <TextInput label="街道地址" value={value.line1} onChange={set("line1")} disabled={disabled} />
       <SimpleGrid cols={{ base: 1, sm: 3 }}>

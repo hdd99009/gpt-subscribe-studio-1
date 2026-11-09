@@ -14,7 +14,7 @@ import {
 import { IconAlertCircle, IconCheck } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 
-import { getProxies, parseProxy, saveProxy, testProxy, type ProxyInfo } from "../api/client";
+import { disableProxies, getProxies, parseProxy, saveProxy, testProxy, type ProxyInfo } from "../api/client";
 
 function Facts({ info }: { info: ProxyInfo }) {
   return (
@@ -38,21 +38,24 @@ export function ProxySettings() {
   const [saved, setSaved] = useState<ProxyInfo | null>(null);
   const [preview, setPreview] = useState<ProxyInfo | null>(null);
   const [message, setMessage] = useState<{ color: "red" | "green"; text: string } | null>(null);
-  const [busy, setBusy] = useState<"parse" | "save" | "test" | null>(null);
+  const [busy, setBusy] = useState<"load" | "parse" | "save" | "test" | "disable" | null>("load");
 
   useEffect(() => {
     getProxies()
       .then((all) => setSaved(all.checkout))
-      .catch(() => setSaved(null));
+      .catch(() => setSaved(null))
+      .finally(() => setBusy(null));
   }, []);
 
-  async function run(kind: "parse" | "save" | "test", action: () => Promise<void>) {
+  async function run(kind: "parse" | "save" | "test" | "disable", action: () => Promise<void>) {
+    if (busy) return;
     setBusy(kind);
     setMessage(null);
     try {
       await action();
     } catch (err) {
-      setMessage({ color: "red", text: err instanceof Error ? err.message : "操作失败" });
+      const detail = err instanceof Error ? err.message : "操作失败";
+      setMessage({ color: "red", text: kind === "disable" ? `取消使用代理未完成，请重试。${detail}` : detail });
     } finally {
       setBusy(null);
     }
@@ -95,6 +98,7 @@ export function ProxySettings() {
           description="支持 主机:端口:账号:密码、http://账号:密码@主机:端口、socks5h://…。不写协议时默认 HTTP；SOCKS5 线路必须带 socks5h:// 前缀。123Proxy 支持账号+ph 格式。"
           placeholder="http://账号-region-US-sid-abc123:密码@gateway.example.com:3010"
           value={raw}
+          disabled={busy !== null}
           onChange={(event) => {
             setRaw(event.currentTarget.value.trim());
             setPreview(null);
@@ -104,7 +108,7 @@ export function ProxySettings() {
           <Button
             variant="light"
             loading={busy === "parse"}
-            disabled={!raw}
+            disabled={!raw || busy !== null}
             onClick={() =>
               void run("parse", async () => {
                 setPreview(await parseProxy(raw));
@@ -142,11 +146,13 @@ export function ProxySettings() {
             <Switch
               label="保存后启用"
               checked={enabled}
+              disabled={busy !== null}
               onChange={(event) => setEnabled(event.currentTarget.checked)}
             />
             <Group>
               <Button
                 loading={busy === "save"}
+                disabled={busy !== null}
                 onClick={() =>
                   void run("save", async () => {
                     const next = await saveProxy(raw, enabled);
@@ -167,7 +173,7 @@ export function ProxySettings() {
       <Group>
         <Button
           variant="default"
-          disabled={!configured || !saved?.enabled}
+          disabled={busy !== null || !configured || !saved?.enabled}
           loading={busy === "test"}
           onClick={() =>
             void run("test", async () => {
@@ -180,6 +186,26 @@ export function ProxySettings() {
           }
         >
           测试连接
+        </Button>
+        <Button
+          type="button"
+          variant="light"
+          color="orange"
+          loading={busy === "disable"}
+          disabled={busy !== null}
+          onClick={() =>
+            void run("disable", async () => {
+              try {
+                await disableProxies();
+              } finally {
+                const all = await getProxies();
+                setSaved(all.checkout);
+              }
+              setMessage({ color: "green", text: "已取消使用代理，之后新建的订单将使用本机直连。" });
+            })
+          }
+        >
+          取消使用代理
         </Button>
       </Group>
 

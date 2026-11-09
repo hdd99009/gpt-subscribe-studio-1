@@ -10,7 +10,9 @@ import pytest
 from types import SimpleNamespace
 
 from gss_core.har_device import DeviceProfile
+from gss_core.chatgpt import ChatGPTClient
 from gss_core.plus_har_protocol import PlusHarProtocol, run_har_context
+from gss_core.session_token import SESSION_COOKIE_CHUNK_SIZE, SESSION_COOKIE_NAME, session_cookie_values
 from gss_core.stripe_protocol import PaymentOutcome
 
 CHECKOUT_ID = "oaics_fixturecheckout"
@@ -201,6 +203,42 @@ def build_harness(**overrides):
     return Harness(**params)
 
 
+def test_read_only_payment_status_skips_sentinel_and_telemetry_writes():
+    engine = build_harness(read_only=True)
+    engine.intent_id = "pi_fixture"
+    engine.intent_secret = "pi_fixture_secret_fixture"
+    result = engine.pay()
+    assert result.state == "pending" and result.intent_status == "succeeded"
+    assert engine.stage == "payment"
+    assert engine.sentinel_flows == []
+    assert engine.stripe.calls == []
+    assert all(method == "GET" for method, route, body in engine.app.calls)
+
+
+def test_verified_intent_is_retained_if_post_payment_processing_fails(monkeypatch):
+    import gss_core.plus_har_protocol as protocol
+    engine = build_harness()
+
+    def fail_after_payment(*args):
+        raise RuntimeError("fixture post-payment interruption")
+
+    engine._flush = lambda phase: None
+    original_prepare = engine._prepare
+
+    def prepare():
+        original_prepare()
+        engine.telemetry.beat = fail_after_payment
+
+    engine._prepare = prepare
+    monkeypatch.setattr(protocol, "PlusHarProtocol", lambda **kwargs: engine)
+    monkeypatch.setattr(protocol, "restore_account", lambda client, expected: "account_fixture")
+    context = {}
+    client = SimpleNamespace(account_id="account_fixture", proxy=None, stripe_direct=False)
+    with pytest.raises(RuntimeError, match="post-payment interruption"):
+        protocol.run_har_context(client, context, {"currency": "JPY"})
+    assert context["payment_confirmed"] is True
+
+
 def test_flow_order_matches_capture():
     engine = build_harness()
     result = engine.pay()
@@ -334,6 +372,7 @@ def test_run_har_context_persists_device_and_ids(monkeypatch):
 
     def fake_pay(self):
         calls["device"] = self.device.to_dict()
+        calls["stripe_direct"] = self.stripe_direct
         self.ctoken = "ctoken_ctx"
         self.intent_id = "pi_ctx"
         self.intent_secret = "pi_ctx_secret"
@@ -353,7 +392,9 @@ def test_run_har_context_persists_device_and_ids(monkeypatch):
         "processor": PROCESSOR,
         "customer_session_client_secret": "cuss_fixture",
     }
-    payload = run_har_context(StubClient(), context, spec, card={"number": "4242"},
+    client = StubClient()
+    client.stripe_direct = True
+    payload = run_har_context(client, context, spec, card={"number": "4242"},
                               billing={"email": "fixture@example.test", "country": "US"})
     assert payload["state"] == "paid"
     assert payload["stage"] == "payment"
@@ -362,6 +403,7 @@ def test_run_har_context_persists_device_and_ids(monkeypatch):
     assert context["intent_id"] == "pi_ctx"
     assert context["amount_minor"] == 1363
     assert context["app_confirmation_started"] is True
+    assert calls["stripe_direct"] is True
 
 
 def test_elements_session_parses_live_body():
@@ -455,3 +497,49 @@ def test_quote_guard_skipped_without_expected():
     h.expected_amount_minor = 0
     h.amount_minor = 9999
     assert h._quote_guard() is None
+
+
+def test_har_web_session_uses_cookie_chunks_without_stale_base(monkeypatch):
+    monkeypatch.delenv("GSS_HAR_CAPTURE", raising=False)
+    token = "a" * SESSION_COOKIE_CHUNK_SIZE + "tail"
+    client = ChatGPTClient(access_token="fixture-access", session_token=token,
+                           extra_cookies={SESSION_COOKIE_NAME: "stale-base"})
+    engine = PlusHarProtocol(session="fixture", client=client, telemetry="off")
+    try:
+        cookies = engine._web_session().cookies.get_dict()
+        assert SESSION_COOKIE_NAME not in cookies
+        assert cookies[SESSION_COOKIE_NAME + ".0"] == "a" * SESSION_COOKIE_CHUNK_SIZE
+        assert cookies[SESSION_COOKIE_NAME + ".1"] == "tail"
+    finally:
+        engine.close()
+        client.close()
+
+
+def test_har_response_rotates_the_session_used_to_cancel_renewal(monkeypatch):
+    from curl_cffi.requests import Cookies
+
+    monkeypatch.delenv("GSS_HAR_CAPTURE", raising=False)
+    client = ChatGPTClient(access_token="fixture-access", session_token="original-session")
+    renewed = "b" * SESSION_COOKIE_CHUNK_SIZE + "rotated-tail"
+    response = FakeResponse({"status": "success"})
+    response.cookies = Cookies()
+    for name, value in session_cookie_values(renewed).items():
+        response.cookies.set(name, value, domain="chatgpt.com", secure=True)
+
+    class Transport:
+        def request(self, method, url, **kwargs):
+            return response
+
+        def close(self):
+            pass
+
+    engine = PlusHarProtocol(session="fixture", client=client, telemetry="off")
+    engine._web = Transport()
+    try:
+        assert engine._app("POST", "/backend-api/payments/checkout/confirm", json_body={}) is response
+        assert client.session_token == renewed
+        cookies = dict(part.split("=", 1) for part in client._cookie_header().split("; "))
+        assert cookies == session_cookie_values(renewed)
+    finally:
+        engine.close()
+        client.close()

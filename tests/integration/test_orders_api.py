@@ -63,6 +63,29 @@ def test_promo_eligibility_is_read_only_and_returns_campaign() -> None:
     assert store.orders == {}
 
 
+def test_order_history_metadata_survives_credential_cleanup(monkeypatch) -> None:
+    monkeypatch.setenv("GSS_USE_FAKE", "1")
+    store.clear()
+    client = TestClient(create_app())
+    created = client.post("/api/orders", json={
+        "plan": "plus", "billing_country": "US",
+        "session": '{"accessToken":"fake-session","user":{"email":"account@example.test"}}',
+    })
+    assert created.status_code == 201, created.text
+    order_id = created.json()["id"]
+    paid = client.post(f"/api/orders/{order_id}/pay", json={
+        "payment_method_token": "pm_fake", "card_last4": "4242",
+    })
+    assert paid.status_code == 200, paid.text
+    assert paid.json()["status"] == "delivered"
+    current = client.get(f"/api/orders/{order_id}").json()
+    assert current["session_email"] == "account@example.test" and current["card_last4"] == "4242"
+    assert client.post(f"/api/orders/{order_id}/pay", json={
+        "payment_method_token": "pm_fake", "card_last4": "12345678",
+    }).status_code == 422
+    store.clear()
+
+
 def test_plus_campaign_id_is_carried_into_promo_checkout(monkeypatch) -> None:
     store.clear()
     monkeypatch.setenv("GSS_ENABLE_PROMO", "1")

@@ -89,6 +89,10 @@ def flow(monkeypatch):
             assert self.account_id == "account_fixture"
             state["calls"].append("real_adapter_subscription_payload")
             return {"plan_type": "plus", "status": "active"}
+        def cancel_subscription_renewal(self, *, expected_plan):
+            assert expected_plan == "plus" and state["verify_active"]
+            state["calls"].append("cancel_renewal")
+            return {"will_renew": False, "already_cancelled": False}
         def close(self):
             state["closed"] += 1
 
@@ -336,6 +340,7 @@ def test_real_subscription_activation_finishes_and_repeated_verify_is_idempotent
     assert result.status_code == 200, result.text
     assert result.json()["status"] == "delivered"
     assert result.json()["subscription"]["active"] is True
+    assert result.json()["renewal"]["status"] == "cancelled"
     assert vault.get(oid) is None
     assert api.post(f"/api/orders/{oid}/verify").json()["status"] == "delivered"
     assert state["calls"].count("verify_subscription") == 1

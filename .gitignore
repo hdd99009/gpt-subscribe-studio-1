@@ -24,6 +24,8 @@ sessions/
 credentials/
 *.session.json
 session.txt
+cookie.txt
+burp/
 *.session.txt
 deploy/.env
 .env

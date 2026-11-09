@@ -36,7 +36,8 @@ def _legacy_engine(monkeypatch):
 def flow(monkeypatch):
     state = {"calls": [], "violations": [], "account": "account_fixture", "minor": 1363,
              "page_status": "open", "payment_status": "unpaid", "pi_status": "requires_confirmation",
-             "after_confirm": "succeeded", "active": True, "closed": 0, "created": 0}
+             "after_confirm": "succeeded", "active": True, "will_renew": True, "closed": 0, "created": 0}
+    monkeypatch.setattr("gss_core.chatgpt.time.sleep", lambda seconds: None)
     body = {"card": {"number": "4242424242424242", "cvc": "123", "exp_month": "12", "exp_year": "2040"},
             "billing": {"name": "Fixture Holder", "email": "fixture@example.test", "line1": "Fixture Street",
                         "city": "Portland", "state": "OR", "postal_code": "97211", "country": "US"},
@@ -95,10 +96,24 @@ def flow(monkeypatch):
             if self.service == "app" and url == APP_BASE + "/backend-api/subscriptions":
                 record("subscription_get")
                 return response({"plan_type": state.get("subscription_plan", "plus"), "is_active": state["active"],
+                    "will_renew": state["will_renew"],
                     "entitlement": {"has_active_subscription": state["active"], "subscription_plan": "chatgptplusplan"}})
             state["violations"].append("unexpected GET " + url)
             raise AssertionError(url)
         def post(self, url, **kwargs):
+            if self.service == "app" and url == APP_BASE + "/backend-api/subscriptions/cancel":
+                record("renewal_cancel", body=kwargs["json"])
+                assert kwargs["json"] == {"account_id": "account_fixture"}
+                assert state["page_status"] == "complete" and state["active"]
+                if state.get("renewal_entered"):
+                    state["renewal_entered"].set()
+                    assert state["renewal_release"].wait(5)
+                if state.get("renewal_http"):
+                    return response({"error": "fixture cancellation rejected"}, state["renewal_http"])
+                state["will_renew"] = False
+                if state.get("renewal_lost"):
+                    raise TimeoutError("fixture cancellation response lost")
+                return response({"success": True})
             if self.service == "app" and url == APP_BASE + "/backend-api/payments/checkout/taxes":
                 record("taxes", body=kwargs["json"])
                 assert kwargs["json"]["checkout_session_id"] == checkout_id
@@ -167,7 +182,16 @@ def flow(monkeypatch):
         def close(self):
             state["closed"] += 1
             if state.get("worker_done"): state["worker_done"].set()
-    monkeypatch.setattr(ChatGPTClient, "from_raw_session", staticmethod(lambda raw, proxy=None: Client()))
+    def from_raw(raw, proxy=None):
+        client = Client()
+        try:
+            snapshot = json.loads(raw)
+        except ValueError:
+            snapshot = {}
+        client.access_token = snapshot.get("accessToken", client.access_token)
+        client.session_token = snapshot.get("sessionToken", client.session_token)
+        return client
+    monkeypatch.setattr(ChatGPTClient, "from_raw_session", staticmethod(from_raw))
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     store.clear()
     with TestClient(create_app()) as api:
@@ -214,6 +238,40 @@ def test_unused_get_is_local_and_has_no_writes(flow):
     assert not flow.state["calls"]
 
 
+def test_stripe_direct_choice_reaches_payment_and_status_clients(flow, monkeypatch):
+    from gss_api.routers import protocol_cards
+
+    original = protocol_cards.run_checkout_protocol
+    routes = []
+
+    def record_route(client, context, spec, **kwargs):
+        routes.append((client.stripe_direct, kwargs.get("read_only", False)))
+        return original(client, context, spec, **kwargs)
+
+    monkeypatch.setattr(protocol_cards, "run_checkout_protocol", record_route)
+    flow.state["minor"] = 1499
+    result = post(flow, {**flow.body, "stripe_direct": True})
+    assert result["stripe_direct"] is True
+    assert result["state"] == "pending"
+    assert get(flow)["stripe_direct"] is True
+    assert routes == [(True, False), (True, True)]
+    before = list(flow.state["calls"])
+    changed = flow.api.post(flow.root, json={**flow.body, "expected_amount": "1499", "stripe_direct": False})
+    assert changed.status_code == 409
+    assert "连接方式" in changed.text
+    assert flow.state["calls"] == before
+
+
+def test_existing_payment_context_without_direct_flag_keeps_proxy_mode(flow):
+    flow.state["minor"] = 1499
+    assert post(flow)["stripe_direct"] is False
+    context = vault.get(flow.oid).saved_card_context
+    context.pop("stripe_direct")  # Orders submitted by the previous version have no route flag.
+    assert get(flow)["stripe_direct"] is False
+    result = post(flow, {**flow.body, "expected_amount": "1499"})
+    assert result["stripe_direct"] is False
+
+
 def test_direct_checkout_uses_one_token_and_original_context_then_delivers(flow):
     result = post(flow)
     assert result["state"] == "paid"
@@ -221,11 +279,197 @@ def test_direct_checkout_uses_one_token_and_original_context_then_delivers(flow)
     assert result["order"]["billing_country"] == "JP"
     assert result["order"]["currency"] == "JPY"
     assert result["order"]["amount"] == "1363"
-    assert names(flow) == ["context_get", "taxes", "update_tax_id", "elements_get", "token_create", "app_confirm", "context_get", "pi_get", "pi_confirm", "context_get", "ack", "subscription_get"]
+    assert names(flow) == ["context_get", "taxes", "update_tax_id", "elements_get", "token_create", "app_confirm", "context_get", "pi_get", "pi_confirm", "context_get", "ack", "subscription_get", "subscription_get", "renewal_cancel", "subscription_get"]
+    assert result["order"]["renewal"]["will_renew"] is False
+    assert result["order"]["card_last4"] == flow.body["card"]["number"][-4:]
     before = list(flow.state["calls"])
     assert get(flow) == post(flow) == result
     assert flow.state["calls"] == before
     assert vault.get(flow.oid) is None
+
+
+def test_cancellation_failure_keeps_payment_success_and_retry_only_cancels(flow):
+    flow.state["renewal_http"] = 503
+    result = post(flow)
+    assert result["state"] == "paid" and result["order"]["status"] == "delivered"
+    assert result["order"]["renewal"]["status"] == "failed"
+    remaining = vault.get(flow.oid)
+    assert remaining and remaining.saved_card_context is None and not remaining.billing
+    previous_calls = names(flow)
+    assert get(flow) == post(flow) == result
+    assert names(flow) == previous_calls
+
+    flow.state["renewal_http"] = None
+    response = flow.api.post(f"/api/orders/{flow.oid}/cancel-renewal")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "delivered"
+    assert response.json()["renewal"]["status"] == "cancelled"
+    assert names(flow)[len(previous_calls):] == ["subscription_get", "renewal_cancel", "subscription_get"]
+    assert vault.get(flow.oid) is None
+    previous_calls = names(flow)
+    assert flow.api.post(f"/api/orders/{flow.oid}/cancel-renewal").json() == response.json()
+    assert names(flow) == previous_calls
+
+
+def test_lost_cancellation_response_is_verified_without_replaying_it(flow):
+    flow.state["renewal_lost"] = True
+    result = post(flow)
+    assert result["state"] == "paid"
+    assert result["order"]["renewal"]["status"] == "cancelled"
+    assert names(flow).count("renewal_cancel") == 1
+    assert vault.get(flow.oid) is None
+
+
+def test_cancellation_retry_before_payment_is_rejected(flow):
+    response = flow.api.post(f"/api/orders/{flow.oid}/cancel-renewal")
+    assert response.status_code == 409
+    assert names(flow) == []
+    assert vault.get(flow.oid) is not None
+
+
+def test_interrupted_response_preserves_one_cancellation_worker(flow):
+    flow.state.update(renewal_entered=threading.Event(), renewal_release=threading.Event())
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=flow.api.app), base_url="http://testserver") as client:
+            original = asyncio.create_task(client.post(flow.root, json=flow.body))
+            try:
+                assert await asyncio.to_thread(flow.state["renewal_entered"].wait, 3)
+                original.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await original
+                current = await client.get(f"/api/orders/{flow.oid}")
+                assert current.json()["status"] == "verifying"
+                assert current.json()["payment_confirmed"] is True
+                assert current.json()["renewal"]["status"] == "pending"
+                retry = asyncio.create_task(client.post(f"/api/orders/{flow.oid}/cancel-renewal"))
+                await asyncio.sleep(0.01)
+                assert names(flow).count("renewal_cancel") == 1
+                flow.state["renewal_release"].set()
+                result = await asyncio.wait_for(retry, timeout=3)
+                assert result.json()["renewal"]["status"] == "cancelled"
+            finally:
+                flow.state["renewal_release"].set()
+
+    asyncio.run(exercise())
+    assert names(flow).count("pi_confirm") == names(flow).count("renewal_cancel") == 1
+    assert vault.get(flow.oid) is None
+
+
+def test_legacy_protocol_payment_also_closes_renewal(flow, monkeypatch):
+    from gss_core.stripe_protocol import PaymentOutcome
+
+    class Protocol:
+        def __init__(self, **kwargs):
+            pass
+
+        def pay_from_url(self):
+            flow.state.update(page_status="complete", payment_status="paid")
+            return PaymentOutcome(state="paid", intent_status="succeeded")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("gss_api.routers.orders.PlusHarProtocol", Protocol)
+    response = flow.api.post(f"/api/orders/{flow.oid}/pay-protocol", json={
+        "card": flow.body["card"], "billing": flow.body["billing"],
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["order"]["status"] == "delivered"
+    assert response.json()["order"]["renewal"]["status"] == "cancelled"
+    assert names(flow) == ["subscription_get", "renewal_cancel", "subscription_get"]
+
+
+def test_har_paid_intent_is_reconciled_automatically_with_updated_credentials(flow, monkeypatch):
+    from gss_api.routers import protocol_cards
+    monkeypatch.setenv("GSS_PLUS_ENGINE", "har")
+    flow.state.update(page_status="complete", payment_status="paid", active=False)
+    engine_calls = []
+
+    def engine(client, context, spec, **kwargs):
+        engine_calls.append((kwargs.get("read_only", False), client.access_token))
+        context.update(account_id="account_fixture", app_confirmation_started=True, intent_id="pi_direct_fixture")
+        client.access_token = "updated-fixture-access"
+        client.session_token = "updated-fixture-cookie"
+        return {"state": "pending", "stage": "payment", "intent_status": "succeeded",
+                "message": "付款已确认，等待订阅生效"}
+
+    monkeypatch.setattr(protocol_cards, "run_checkout_protocol", engine)
+    first = post(flow)
+    assert first["order"]["status"] == "verifying"
+    assert first["payment_confirmed"] is True
+    assert first["order"]["renewal"]["status"] == "pending"
+    snapshot = json.loads(vault.get(flow.oid).session)
+    assert snapshot["accessToken"] == "updated-fixture-access"
+    assert snapshot["sessionToken"] == "updated-fixture-cookie"
+    flow.state["active"] = True
+    for attempt in range(80):
+        current = flow.api.get(f"/api/orders/{flow.oid}").json()
+        if current["status"] == "delivered":
+            break
+        threading.Event().wait(0.03)
+    assert current["status"] == "delivered"
+    assert current["renewal"]["will_renew"] is False
+    assert engine_calls == [(False, "fixture-access"), (True, "updated-fixture-access")]
+    assert names(flow).count("renewal_cancel") == 1
+
+
+def test_har_session_failure_cannot_erase_confirmed_payment(flow, monkeypatch):
+    from gss_api.routers import protocol_cards
+    monkeypatch.setenv("GSS_PLUS_ENGINE", "har")
+    flow.state.update(page_status="complete", payment_status="paid", active=False)
+
+    def engine(client, context, spec, **kwargs):
+        if kwargs.get("read_only"):
+            return {"state": "unknown", "stage": "checkout", "code": "invalid_session", "message": "Session 无效或已过期"}
+        context.update(account_id="account_fixture", app_confirmation_started=True, intent_id="pi_direct_fixture")
+        return {"state": "pending", "stage": "payment", "intent_status": "succeeded"}
+
+    monkeypatch.setattr(protocol_cards, "run_checkout_protocol", engine)
+    assert post(flow)["payment_confirmed"] is True
+    checked = get(flow)
+    assert (checked["state"], checked["stage"]) == ("pending", "payment")
+    assert checked["order"]["payment_confirmed"] is True
+    assert checked["order"]["status"] == "verifying"
+    assert checked["order"]["renewal"]["status"] == "failed"
+    assert "付款已确认" in checked["message"]
+    assert "renewal_cancel" not in names(flow)
+
+
+def test_har_renewal_auth_failure_replaces_stale_activation_message(flow, monkeypatch):
+    from gss_api.routers import protocol_cards
+    monkeypatch.setenv("GSS_PLUS_ENGINE", "har")
+
+    def engine(client, context, spec, **kwargs):
+        context.update(account_id="account_fixture", payment_confirmed=True)
+        return {"state": "pending", "stage": "payment", "intent_status": "succeeded",
+                "message": "付款已确认，等待 Plus 订阅生效"}
+
+    monkeypatch.setattr(protocol_cards, "run_checkout_protocol", engine)
+    monkeypatch.setattr(protocol_cards, "_cancel_renewal", lambda *args, **kwargs: {
+        "status": "failed", "message": "Session 无效或已过期", "retryable": False,
+    })
+    result = post(flow)
+    assert result["payment_confirmed"] is True
+    assert result["state"] == "pending"
+    assert result["order"]["renewal"]["status"] == "failed"
+    assert result["message"] == result["order"]["last_error"] == "Session 无效或已过期"
+
+
+def test_har_verified_payment_survives_post_payment_processing_error(flow, monkeypatch):
+    from gss_api.routers import protocol_cards
+    monkeypatch.setenv("GSS_PLUS_ENGINE", "har")
+    flow.state.update(page_status="complete", payment_status="paid")
+
+    def engine(client, context, spec, **kwargs):
+        context.update(account_id="account_fixture", app_confirmation_started=True, payment_confirmed=True)
+        raise RuntimeError("fixture post-payment interruption")
+
+    monkeypatch.setattr(protocol_cards, "run_checkout_protocol", engine)
+    result = post(flow)
+    assert result["state"] == "paid"
+    assert result["order"]["renewal"]["will_renew"] is False
+    assert names(flow).count("renewal_cancel") == 1
 
 
 def test_changed_tax_quote_requires_user_confirmation_and_no_card_write(flow):
