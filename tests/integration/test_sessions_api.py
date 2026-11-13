@@ -111,6 +111,49 @@ def test_rejected_session_does_not_claim_validity(inspect_api):
     assert len(calls) == 1 and closed == [True]
 
 
+def test_missing_subscription_is_a_valid_free_account_with_email(inspect_api):
+    client, calls, closed = inspect_api([({"detail": "No subscription found for account"}, 404)])
+    response = client.post("/api/sessions/check", json={"session": access_token()})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["valid"] is True and data["plan_type"] == "free" and data["active"] is False
+    assert data["email"] == "account@example.test"
+    assert data["expires_at"] is None and data["will_renew"] is None
+    assert json.loads(data["session"])["email"] == data["email"]
+    assert len(calls) == 1 and closed == [True] and store.orders == {}
+
+
+def test_missing_subscription_after_token_recovery_uses_the_refreshed_email(inspect_api):
+    fresh = access_token("renewed@example.test", 200)
+    client, calls, closed = inspect_api([
+        ({"detail": {"code": "token_expired"}}, 401),
+        ({"accessToken": fresh, "sessionToken": "renewed-cookie"}, 200),
+        ({"detail": "No subscription found for account"}, 404),
+    ])
+    response = client.post("/api/sessions/check", json={"session": json.dumps({
+        "accessToken": access_token(), "sessionToken": "original-cookie",
+    })})
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["valid"] is True and data["plan_type"] == "free" and data["active"] is False
+    assert data["email"] == "renewed@example.test"
+    snapshot = json.loads(data["session"])
+    assert snapshot["accessToken"] == fresh and snapshot["sessionToken"] == "renewed-cookie"
+    assert len(calls) == 3 and closed == [True]
+
+
+@pytest.mark.parametrize("payload,status", [
+    ({"detail": "Not Found"}, 404),
+    ({"detail": "No subscription found for account"}, 500),
+    ({"detail": "No subscription found for account"}, 403),
+])
+def test_other_upstream_errors_do_not_claim_a_valid_free_account(inspect_api, payload, status):
+    client, calls, closed = inspect_api([(payload, status)])
+    response = client.post("/api/sessions/check", json={"session": access_token()})
+    assert response.status_code != 200
+    assert len(calls) == 1 and closed == [True]
+
+
 def test_empty_membership_response_does_not_claim_validity(inspect_api):
     client, _, closed = inspect_api([({}, 200)])
     response = client.post("/api/sessions/check", json={"session": access_token()})

@@ -51,6 +51,13 @@ def subscription(will_renew):
     return {"plan_type": "plus", "is_active": True, "will_renew": will_renew}
 
 
+def test_missing_subscription_is_still_an_error_by_default(client_factory):
+    client, calls = client_factory([({"detail": "No subscription found for account"}, 404)])
+    with pytest.raises(DomainError):
+        client.subscription_payload()
+    assert [call[0] for call in calls] == ["GET"]
+
+
 def test_cancels_once_and_requires_subscription_readback(client_factory):
     client, calls = client_factory([subscription(True), subscription(False)])
     result = client.cancel_subscription_renewal(expected_plan="plus")

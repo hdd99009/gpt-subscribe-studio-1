@@ -186,6 +186,7 @@ class PlusHarProtocol:
         self.ctoken = ""
         self._radar_cached = ""
         self.confirmed: Dict[str, Any] = {}
+        self.app_confirmation_started = False
         self.intent_id = ""
         self.intent_secret = ""
         self.last_error: Dict[str, str] = {}
@@ -756,6 +757,7 @@ class PlusHarProtocol:
             "confirm_token": self.ctoken,
             "selected_payment_method_type": "card",
         }
+        self.app_confirmation_started = True
         response = self._app("POST", "/backend-api/payments/checkout/confirm", json_body=body,
                              telemetry=oai_telemetry_header((time.time() - self.t0) * 1000))
         payload = _json(response)
@@ -1031,7 +1033,20 @@ class PlusHarProtocol:
                     publishable_key=self.publishable_key)
             except Exception:  # noqa: BLE001
                 intent = {}
+            if intent.get("id") != self.intent_id:
+                out.state = "unknown"
+                out.message = "未能核实原付款 Intent，请继续查询协议状态"
+                return out
             state = str(intent.get("status") or "")
+            if state in {"requires_confirmation", "requires_payment_method"} and self.intent_id.startswith("pi_"):
+                if (type(intent.get("amount")) is not int or intent["amount"] != self.amount_minor
+                        or str(intent.get("currency") or "").upper() != self.currency
+                        or self._total_minor(page) != self.amount_minor):
+                    out.state = "unknown"
+                    out.message = "原付款金额或币种与账单不一致，请核对原订单"
+                    return out
+            self.raw["intent"] = intent
+            out.intent_status = state or None
             if state == "succeeded":
                 out.state = "pending"
                 out.intent_status = state
@@ -1042,6 +1057,9 @@ class PlusHarProtocol:
                 out.intent_status = state
                 out.message = "Stripe 未完成本次付款"
                 return out
+            out.state = "pending"
+            out.message = "原付款结果待核实，请继续查询协议状态"
+            return out
         out.state = "pending"
         out.message = "原结账尚未提交付款"
         return out
@@ -1154,7 +1172,32 @@ def run_har_context(
         engine.amount_minor = int(context["amount_minor"])
         engine.expected_amount_minor = engine.amount_minor
     try:
-        result = engine.pay()
+        if spec.get("retry_route") and not read_only:
+            engine.read_only = True
+            result = engine.pay()
+            page = engine.raw.get("checkout") or {}
+            open_checkout = page.get("status") == "open" and page.get("payment_status") == "unpaid"
+            app_started = context.get("app_confirmation_started", context.get("har_stage") == "payment")
+            if open_checkout and result.intent_status == "requires_confirmation" and engine.ctoken:
+                engine.read_only = False
+                engine._intent_confirm()
+                result = engine._settle()
+            elif open_checkout and (result.intent_status == "requires_payment_method" or not (app_started or engine.intent_id)):
+                if result.intent_status == "requires_payment_method":
+                    for key in ("app_confirmation_started", "confirmation_token", "intent_id", "intent_secret"):
+                        context.pop(key, None)
+                    engine.ctoken = ""
+                    engine.intent_id = ""
+                    engine.intent_secret = ""
+                    engine.raw.pop("intent", None)
+                engine.read_only = False
+                result = engine.pay()
+            elif app_started and not engine.intent_id and result.state == "pending" and open_checkout:
+                result.state = "unknown"
+                result.message = "原结账确认结果待核实，请继续查询协议状态"
+                engine.stage = "payment"
+        else:
+            result = engine.pay()
     except DomainError as exc:
         declined = str(exc.code) == str(ErrorCode.PAYMENT_DECLINED)
         payload = outcome("card_declined" if declined else "unknown", engine.stage,
@@ -1183,8 +1226,8 @@ def run_har_context(
         if pm:
             context["payment_method_id"] = pm
         context["har_stage"] = engine.stage
-        if engine.confirmed:
-            context["app_confirmation_started"] = True
+        context["app_confirmation_started"] = bool(context.get("app_confirmation_started")
+                                                   or engine.app_confirmation_started or engine.confirmed)
         engine.close()
     payload = outcome_from_payment(result, stage=engine.stage)
     payload["stage"] = engine.stage

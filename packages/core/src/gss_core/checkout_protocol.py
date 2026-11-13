@@ -235,7 +235,7 @@ def _paid_checkout(client: ChatGPTClient, context: dict, *, read_only: bool) -> 
                    intent_status="succeeded")
 
 
-def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
+def _intent(client: ChatGPTClient, context: dict, *, read_only: bool, retry_confirmation: bool = False) -> dict:
     completed = _paid_checkout(client, context, read_only=read_only)
     if completed:
         return completed
@@ -262,7 +262,8 @@ def _intent(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict:
             return outcome("unknown", "payment", "付款 Intent 的金额或币种未核实")
         if raw_amount != _minor(context["amount"], context["currency"]):
             return outcome("unknown", "payment", "付款金额与已确认报价不一致，尚未重新确认")
-    if status == "requires_confirmation" and not context.get("stripe_confirmation_started"):
+    if (status in {"requires_confirmation", "requires_payment_method"} and context.get("confirmation_token")
+            and (not context.get("stripe_confirmation_started") or retry_confirmation)):
         if read_only:
             return outcome("pending", "checkout", "付款 Intent 已准备好，请确认当前金额后继续", intent_status=status)
         context["stripe_confirmation_started"] = True
@@ -300,7 +301,8 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
         return run_har_context(client, context, spec, card=card, billing=billing, read_only=read_only)
     stage = "checkout"
     terminal = context.get("terminal_result")
-    if terminal:
+    retry_route = bool(spec.get("retry_route") and not read_only)
+    if terminal and not retry_route:
         return dict(terminal)
     try:
         restore_account(client, str(context.get("account_id") or spec.get("account_id") or ""))
@@ -314,12 +316,24 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
         if not str(context["checkout_id"]).startswith("oaics_"):
             return outcome("integration_error", "checkout", "当前 HAR 直付契约仅支持 oaics_ 自定义结账", code="checkout_kind_unsupported")
         if context.get("app_confirmation_started"):
-            return _intent(client, context, read_only=read_only)
+            if not retry_route:
+                return _intent(client, context, read_only=read_only)
+            reconciled = _intent(client, context, read_only=True)
+            if reconciled.get("intent_status") == "requires_confirmation":
+                return _intent(client, context, read_only=False, retry_confirmation=True)
+            if reconciled.get("intent_status") != "requires_payment_method":
+                return reconciled
+            for key in ("app_confirmation_started", "stripe_confirmation_started", "confirmation_token",
+                        "intent_id", "intent_secret", "token_started", "terminal_result", "stripe_last_response_error"):
+                context.pop(key, None)
         original = _read_checkout(client, context)
         if original.get("status") == "complete":
             return _paid_checkout(client, context, read_only=read_only) or outcome("unknown", "payment", "原结账已关闭，付款状态待核实")
         if original.get("status") != "open" or original.get("payment_status") != "unpaid":
             return outcome("request_rejected", "checkout", "原结账不处于可付款状态，请核对原订单")
+        if retry_route:
+            context.pop("terminal_result", None)
+            context.pop("token_started", None)
         if context.get("token_started") and not context.get("confirmation_token"):
             return outcome("unknown", "setup", "原卡片准备结果待核实，本次未重复提交")
         if read_only:

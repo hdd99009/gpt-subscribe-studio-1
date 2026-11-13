@@ -121,8 +121,9 @@ def _context(order_id: str, *, start: bool):
     return order, secrets, store.view(order_id), context
 
 
-def _spec(order, view, secrets, payload=None):
+def _spec(order, view, secrets, payload=None, *, retry_route=False):
     return {
+        "retry_route": retry_route,
         "order_id": order.id,
         "account_id": secrets.account_id, "country": order.billing_country,
         "promo": order.mode.billing_mode is BillingMode.PROMO,
@@ -246,7 +247,9 @@ async def _settle_payment(order_id: str) -> None:
 async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> dict:
     async with _team_locks.setdefault(order_id, asyncio.Lock()):
         cached = _cached(order_id)
-        if cached:
+        retry_failed = bool(cached and cached.get("state") == "card_declined" and not cached.get("payment_confirmed")
+                            and bool(cached.get("stripe_direct", False)) != payload.stripe_direct)
+        if cached and not retry_failed:
             return cached
         if use_fake_adapters():
             raise HTTPException(409, "离线模式不会提交真实绑卡或付款请求")
@@ -263,12 +266,13 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
         billing = {key: value.strip() for key, value in payload.billing.model_dump().items()}
         billing["country"] = billing["country"].upper()
         order, secrets, view, context = _context(order_id, start=True)
-        if context.get("request_fingerprint") and bool(context.get("stripe_direct", False)) != payload.stripe_direct:
-            raise HTTPException(409, "本订单已确定 Stripe 连接方式，请查询原结果或重新创建订单")
+        previous = context.get("request_fingerprint")
+        retry_route = bool(previous) and bool(context.get("stripe_direct", False)) != payload.stripe_direct
+        if retry_route and context["operation_lock"].locked():
+            raise HTTPException(409, "原支付请求仍在处理，请查询协议状态后重试")
         card = payload.card.model_dump()
         request = json.dumps({"card": card, "billing": billing}, sort_keys=True, separators=(",", ":")).encode()
         fingerprint = hmac.new(context["request_key"], request, hashlib.sha256).digest()
-        previous = context.get("request_fingerprint")
         if previous and not hmac.compare_digest(previous, fingerprint):
             raise HTTPException(409, "本订单已开始处理另一份支付资料，请查询原结果或重新创建订单")
         context["request_fingerprint"] = fingerprint
@@ -277,7 +281,9 @@ async def bind_and_pay_protocol(order_id: str, payload: BindProtocolRequest) -> 
         secrets.billing = billing
         view.billing = dict(billing)
         view.card_last4 = payload.card.last4
-        return await _run_and_apply(order, secrets, view, context, _spec(order, view, secrets, payload),
+        if retry_failed:
+            store.update_status(order.id, OrderStatus.AWAITING_PAYMENT)
+        return await _run_and_apply(order, secrets, view, context, _spec(order, view, secrets, payload, retry_route=retry_route),
                                     card=card, billing=billing)
 
 

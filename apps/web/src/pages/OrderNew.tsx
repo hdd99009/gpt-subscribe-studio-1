@@ -427,7 +427,7 @@ export function OrderNew({ onRecord }: Props) {
     <form onSubmit={submit}>
       <div className={`order-layout${step === 1 && order && payMode === "protocol" ? " order-layout--split" : ""}`}>
         <Paper className="order-main" withBorder p="lg" radius="md">
-          <Stepper active={step} size="sm" mb="lg" allowNextStepsSelect={false}>
+          <Stepper active={result && SUCCESS_STATUSES.includes(result.status) ? 3 : step} size="sm" mb="lg" allowNextStepsSelect={false}>
             <Stepper.Step label="配置订单" description="session、套餐、地区" />
             <Stepper.Step label={order?.plan === "plus" ? pmMode === "server" ? "协议支付" : "Stripe 输入框支付" : linkOnly ? "长链支付" : "填卡支付"} description={linkOnly ? "打开链接付款" : "地址与卡片"} />
             <Stepper.Step label="结果" description="成功或失败" />
@@ -675,7 +675,7 @@ export function OrderNew({ onRecord }: Props) {
         )}
 
         <div className="order-side">
-          <OrderSummary plan={plan} country={country} order={order} seats={team.seats} />
+          <OrderSummary plan={plan} country={country} order={result ?? order} seats={team.seats} />
           {teamOrder && order && step < 2 && order.status === "awaiting_payment" && (
             <Button variant="light" fullWidth mt="xs" loading={busy} type="button" onClick={async () => {
               setBusy(true); setError(null);

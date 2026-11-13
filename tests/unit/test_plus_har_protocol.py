@@ -543,3 +543,79 @@ def test_har_response_rotates_the_session_used_to_cancel_renewal(monkeypatch):
     finally:
         engine.close()
         client.close()
+
+
+@pytest.mark.parametrize("intent_status,app_started,expected,confirmations", [
+    (None, False, "paid", 1),
+    (None, True, "unknown", 0),
+    ("requires_confirmation", True, "pending", 1),
+    ("requires_payment_method", True, "paid", 1),
+    ("processing", True, "pending", 0),
+    ("succeeded", True, "pending", 0),
+    ("requires_action", True, "pending", 0),
+])
+def test_har_route_retry_reconciles_the_original_checkout(monkeypatch, intent_status, app_started, expected, confirmations):
+    engine = build_harness()
+    monkeypatch.setattr("gss_core.plus_har_protocol.PlusHarProtocol", lambda **kwargs: engine)
+    monkeypatch.setattr(StubClient, "retrieve_stripe_intent", lambda self, **kwargs: {
+        "id": "pi_fixture", "status": intent_status, "amount": 1499, "currency": "jpy",
+    })
+    context = {"app_confirmation_started": app_started, "amount_minor": 1499}
+    if intent_status:
+        context.update(intent_id="pi_fixture", intent_secret="pi_fixture_secret_fixture",
+                       confirmation_token="ctoken_previous")
+    result = run_har_context(StubClient(), context, {
+        "retry_route": True, "checkout_id": CHECKOUT_ID, "currency": "JPY", "country": "US",
+    })
+    assert result["state"] == expected
+    assert sum(route == "/v1/payment_intents/pi_fixture/confirm" for method, route in engine.stripe.calls) == confirmations
+    app_confirmations = [call for call in engine.app.calls if call[1] == "/backend-api/payments/checkout/confirm"]
+    if intent_status == "requires_confirmation":
+        assert app_confirmations == []
+        assert context["confirmation_token"] == "ctoken_previous"
+        assert context["payment_confirmed"] is True
+    elif expected == "paid":
+        assert len(app_confirmations) == 1
+        assert context["confirmation_token"] == "ctoken_fixture"
+    else:
+        assert app_confirmations == []
+        assert not engine.stripe.calls
+
+
+@pytest.mark.parametrize("field,value", [("id", "pi_other"), ("amount", 999), ("currency", "usd")])
+def test_har_route_retry_checks_the_intent_identity_and_amount(monkeypatch, field, value):
+    engine = build_harness()
+    monkeypatch.setattr("gss_core.plus_har_protocol.PlusHarProtocol", lambda **kwargs: engine)
+    intent = {"id": "pi_fixture", "status": "requires_confirmation", "amount": 1499, "currency": "jpy", field: value}
+    monkeypatch.setattr(StubClient, "retrieve_stripe_intent", lambda self, **kwargs: intent)
+    context = {"app_confirmation_started": True, "amount_minor": 1499, "intent_id": "pi_fixture",
+               "intent_secret": "pi_fixture_secret_fixture", "confirmation_token": "ctoken_previous"}
+    result = run_har_context(StubClient(), context, {
+        "retry_route": True, "checkout_id": CHECKOUT_ID, "currency": "JPY", "country": "US",
+    })
+    assert result["state"] == "unknown"
+    assert engine.stripe.calls == []
+    assert all(method == "GET" for method, route, body in engine.app.calls)
+
+
+def test_har_remembers_a_checkout_confirmation_with_a_lost_response(monkeypatch):
+    engine = build_harness()
+    original = engine.app.request
+    attempts = []
+
+    def request(method, url, **kwargs):
+        if method == "POST" and url.endswith("/backend-api/payments/checkout/confirm"):
+            attempts.append(url)
+            raise ConnectionError("fixture confirmation response lost")
+        return original(method, url, **kwargs)
+
+    engine.app.request = request
+    monkeypatch.setattr("gss_core.plus_har_protocol.PlusHarProtocol", lambda **kwargs: engine)
+    context = {}
+    spec = {"checkout_id": CHECKOUT_ID, "currency": "JPY", "country": "US"}
+    with pytest.raises(ConnectionError):
+        run_har_context(StubClient(), context, spec)
+    assert context["app_confirmation_started"] is True
+    retried = run_har_context(StubClient(), context, {**spec, "retry_route": True})
+    assert retried["state"] == "unknown"
+    assert len(attempts) == 1

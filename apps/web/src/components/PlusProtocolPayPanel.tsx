@@ -81,8 +81,11 @@ export function PlusProtocolPayPanel({
   const price = formatAmount(amount, currency);
   const hasQuote = amount != null && amount !== "" && Number.isFinite(Number(amount)) && Number(amount) >= 0 && Boolean(currency);
   const quoteChanged = result?.state === "pending" && result.stage === "checkout";
-  const canSubmit = !disabled && !submissionDisabled && work === null && hasQuote && !needsQuery
-    && protocolPostReady(result) && (!quoteChanged || quoteConfirmed);
+  const paymentConfirmed = Boolean(result?.payment_confirmed || result?.order?.payment_confirmed || (result && protocolIsPaid(result)));
+  const routeRetry = Boolean(submittedDetails.current && !paymentConfirmed
+    && Boolean(submittedDetails.current.stripe_direct) !== stripeDirect);
+  const canSubmit = !disabled && work === null && hasQuote && (routeRetry
+    || (!submissionDisabled && !needsQuery && protocolPostReady(result) && (!quoteChanged || quoteConfirmed)));
   const fieldsDisabled = disabled || work !== null || submitted;
   const billingDisabled = fieldsDisabled || Boolean(initialBilling);
 
@@ -123,15 +126,17 @@ export function PlusProtocolPayPanel({
 
   function submitProtocol() {
     if (!canSubmit) return;
-    const details = submittedDetails.current || {
+    const details = {
+      ...(submittedDetails.current || {
+        card: { ...card, number: card.number.replace(/[\s-]/g, "") },
+        billing: {
+          ...billing,
+          name: billing.name.trim(), email: (billing.email || "").trim(), line1: billing.line1.trim(),
+          city: billing.city.trim(), state: billing.state.trim(), postal_code: billing.postal_code.trim(),
+          country: billing.country.trim().toUpperCase(),
+        },
+      }),
       stripe_direct: stripeDirect,
-      card: { ...card, number: card.number.replace(/[\s-]/g, "") },
-      billing: {
-        ...billing,
-        name: billing.name.trim(), email: (billing.email || "").trim(), line1: billing.line1.trim(),
-        city: billing.city.trim(), state: billing.state.trim(), postal_code: billing.postal_code.trim(),
-        country: billing.country.trim().toUpperCase(),
-      },
     };
     const invalid = protocolCardError(details.card) || protocolBillingError(details.billing);
     if (invalid) { setError(invalid); return; }
@@ -187,7 +192,7 @@ export function PlusProtocolPayPanel({
         )}
       </Paper>
       <Text size="sm">填写持卡人的卡片和真实账单，确认金额后提交。服务端沿用当前订单 checkout，依次核算税费、创建 confirmation_tokens、完成 ChatGPT confirm 与 PaymentIntent confirm，再通过 GET checkout 核对 complete / paid 并查询订阅。</Text>
-      <Text size="xs" c="dimmed">每个订单沿用首次提交的同一份卡片和账单，修改资料请重新开始。付款确认后仍需等待订阅生效；结果待核实时仅查询状态，不重放付款请求。</Text>
+      <Text size="xs" c="dimmed">每个订单沿用首次提交的卡片和账单，修改资料请重新开始。付款确认后仍需等待订阅生效。切换连接方式再次提交时，会先核对原订单状态。</Text>
       <Paper withBorder p="md" radius="md">
         <Stack gap="sm">
           <TextInput label="卡号" value={card.number} onChange={changeCard("number")} inputMode="numeric" autoComplete="cc-number" disabled={fieldsDisabled} data-testid="protocol-card-number" />
@@ -222,7 +227,7 @@ export function PlusProtocolPayPanel({
             disabled={disabled || work !== null} onChange={(event) => setQuoteConfirmed(event.currentTarget.checked)} />
         </Alert>
       )}
-      {(needsQuery || result?.state === "unknown") && <Alert color="yellow">请求结果待核实，请使用「查询协议状态」。</Alert>}
+      {(needsQuery || result?.state === "unknown") && <Alert color="yellow">请求结果待核实，可查询协议状态，或切换连接方式后再次提交。</Alert>}
       {result && (
         <Alert color={protocolIsPaid(result) ? "green" : result.state === "integration_error" || result.state === "request_rejected" ? "red" : result.state === "challenge_required" ? "yellow" : "blue"} role="status">
           <Stack gap="xs">
@@ -239,8 +244,8 @@ export function PlusProtocolPayPanel({
           </Stack>
         </Alert>
       )}
-      <Checkbox label="Stripe 支付直连" checked={stripeDirect} disabled={fieldsDisabled}
-        description="勾选后，由运行本站的电脑直接连接 Stripe，ChatGPT 请求使用建单出口。首次提交后沿用本次选择。"
+      <Checkbox label="Stripe 支付直连" checked={stripeDirect} disabled={disabled || work !== null || paymentConfirmed}
+        description="勾选后，由运行本站的电脑直接连接 Stripe，ChatGPT 请求使用建单出口。付款失败后可切换连接方式并再次提交。"
         onChange={(event) => setStripeDirect(event.currentTarget.checked)} />
       <Text size="sm" c="dimmed">付款成功后自动关闭续费，结果会显示在开通完成页。</Text>
       <Group justify="space-between">

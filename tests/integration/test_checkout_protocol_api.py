@@ -86,6 +86,8 @@ def flow(monkeypatch):
                 return response(page())
             if self.service == "stripe" and url == STRIPE_BASE + "/v1/elements/sessions":
                 record("elements_get", params=kwargs["params"])
+                if state.get("elements_fail"):
+                    raise ConnectionError("fixture Stripe connection failed")
                 assert kwargs["params"]["customer_session_client_secret"] == "cuss_fixture"
                 assert kwargs["params"]["deferred_intent[amount]"] == str(state["minor"])
                 return response({"customer": "cus_fixture"})
@@ -155,6 +157,8 @@ def flow(monkeypatch):
                 assert form["confirmation_token"] == "ctoken_fixture"
                 assert "payment_method" not in form
                 assert form["client_secret"] == "pi_direct_fixture_secret_fixture"
+                if state.get("pi_fail_before_confirm"):
+                    raise ConnectionError("fixture Stripe confirmation connection failed")
                 state["pi_status"] = state["after_confirm"]
                 if state["pi_status"] == "succeeded" and not state.get("page_delayed"):
                     state.update(page_status="complete", payment_status="paid")
@@ -255,11 +259,61 @@ def test_stripe_direct_choice_reaches_payment_and_status_clients(flow, monkeypat
     assert result["state"] == "pending"
     assert get(flow)["stripe_direct"] is True
     assert routes == [(True, False), (True, True)]
-    before = list(flow.state["calls"])
     changed = flow.api.post(flow.root, json={**flow.body, "expected_amount": "1499", "stripe_direct": False})
-    assert changed.status_code == 409
-    assert "连接方式" in changed.text
-    assert flow.state["calls"] == before
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["state"] == "paid" and changed.json()["stripe_direct"] is False
+    assert routes[-1] == (False, False)
+
+
+@pytest.mark.parametrize("failure,token_count,confirm_count", [
+    ("elements_fail", 1, 1), ("token_lost", 2, 1), ("pi_fail_before_confirm", 1, 2),
+])
+def test_route_change_retries_connection_failure_on_the_original_checkout(flow, failure, token_count, confirm_count):
+    flow.state[failure] = True
+    assert post(flow)["state"] == "unknown"
+    flow.state[failure] = False
+    result = post(flow, {**flow.body, "stripe_direct": True})
+    assert result["state"] == "paid" and result["stripe_direct"] is True
+    assert result["order"]["id"] == flow.oid
+    assert names(flow).count("token_create") == token_count
+    assert names(flow).count("app_confirm") == 1
+    assert names(flow).count("pi_confirm") == confirm_count
+    assert names(flow).count("ack") == 1
+
+
+def test_route_retry_reconciles_a_lost_checkout_confirmation_without_replaying(flow):
+    flow.state["app_lost"] = True
+    assert post(flow)["state"] == "unknown"
+    result = post(flow, {**flow.body, "stripe_direct": True})
+    assert result["state"] == "unknown" and result["stripe_direct"] is True
+    assert names(flow).count("app_confirm") == 1
+    assert "pi_confirm" not in names(flow)
+
+
+def test_route_retry_after_card_rejection_requires_the_original_unpaid_intent(flow):
+    flow.state["after_confirm"] = "requires_payment_method"
+    first = post(flow)
+    assert first["state"] == "card_declined" and first["order"]["status"] == "failed"
+    flow.state["after_confirm"] = "succeeded"
+    retried = post(flow, {**flow.body, "stripe_direct": True})
+    assert retried["state"] == "paid" and retried["order"]["status"] == "delivered"
+    assert names(flow).count("app_confirm") == names(flow).count("pi_confirm") == 2
+    assert names(flow).count("ack") == 1
+
+
+def test_route_change_waits_for_an_inflight_payment(flow):
+    flow.state["minor"] = 1499
+    assert post(flow)["state"] == "pending"
+    context = vault.get(flow.oid).saved_card_context
+    context["operation_lock"].acquire()
+    before = list(flow.state["calls"])
+    try:
+        response = flow.api.post(flow.root, json={**flow.body, "expected_amount": "1499", "stripe_direct": True})
+        assert response.status_code == 409
+        assert context["stripe_direct"] is False
+        assert flow.state["calls"] == before
+    finally:
+        context["operation_lock"].release()
 
 
 def test_existing_payment_context_without_direct_flag_keeps_proxy_mode(flow):

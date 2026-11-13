@@ -41,7 +41,7 @@ def _inspect_session(raw: str) -> SessionCheckOut:
     try:
         if not client.access_token and not client.refresh_session():
             raise DomainError(ErrorCode.INVALID_SESSION, "无法从当前会话取得访问令牌")
-        payload = client.subscription_payload()
+        payload = client.subscription_payload(allow_missing=True)
         entitlement = payload.get("entitlement") or {}
         subscription = payload.get("subscription") or {}
         legacy_plan = payload.get("plan") or {}

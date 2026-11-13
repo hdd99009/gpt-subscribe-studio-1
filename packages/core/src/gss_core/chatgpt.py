@@ -1881,7 +1881,7 @@ class ChatGPTClient:
             _raise_stripe(payload, status)
         return payload
 
-    def subscription_payload(self) -> Dict[str, Any]:
+    def subscription_payload(self, *, allow_missing: bool = False) -> Dict[str, Any]:
         if not self.account_id:
             self.hydrate()
         for attempt in range(2):
@@ -1896,11 +1896,15 @@ class ChatGPTClient:
                 failed_path="/backend-api/subscriptions",
             ):
                 break
-        if int(getattr(response, "status_code", 0) or 0) == 401:
+        status = int(getattr(response, "status_code", 0) or 0)
+        payload = _json(response)
+        if status == 404 and allow_missing and payload.get("detail") == "No subscription found for account":
+            return {"plan_type": "free", "is_active": False}
+        if status == 401:
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
+        if status >= 400:
             self._raise(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, response, "查询订阅")
-        return _json(response)
+        return payload
 
     def cancel_subscription_renewal(self, *, expected_plan: str) -> Dict[str, Any]:
         """Cancel renewal once, then reconcile against the subscription itself."""
