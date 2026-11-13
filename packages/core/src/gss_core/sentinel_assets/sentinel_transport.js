@@ -22,7 +22,7 @@ function killTree(child) {
   });
 }
 
-function makePythonCurlFetch({ python, helper, proxy, timeoutMs, onFailure = () => {} }) {
+function makePythonCurlFetch({ python, helper, proxy, timeoutMs, impersonate = "chrome150", onFailure = () => {} }) {
   return function pythonCurlFetch(url, opts = {}) {
     return new Promise((resolve, reject) => {
       const child = spawn(python, [helper], {
@@ -68,7 +68,7 @@ function makePythonCurlFetch({ python, helper, proxy, timeoutMs, onFailure = () 
       });
       child.stdin.end(JSON.stringify({ url: String(url), method: opts.method || "GET",
         headers: opts.headers || {}, body: opts.body == null ? null : String(opts.body),
-        proxy, timeout: timeoutMs / 1000 }));
+        proxy, impersonate, timeout: timeoutMs / 1000 }));
     });
   };
 }

@@ -151,6 +151,8 @@ def mint(
     screen_h: int = 1080,
     avail_h: int = 1032,
     cores: int = 8,
+    impersonate: str = "chrome150",
+    client_hints: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     """返回哨兵 JSON；失败返回空 dict，由调用方决定是否中止。"""
     _diagnostic.failure = {}
@@ -167,6 +169,8 @@ def mint(
     payload = json.dumps(
         {
             "ua": user_agent,
+            "impersonate": impersonate,
+            "clientHints": client_hints or {},
             "cores": cores,
             "deviceId": device_id,
             "flow": flow,

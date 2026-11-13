@@ -302,6 +302,7 @@ class _FakeHttp:
         self.headers: dict = {}
         self.cookies: dict = {}
         self.posts: list = []
+        self.pings: list = []
         self._html = html
         self.payload = payload or {
             "checkout_session_id": "cs_test_1",
@@ -316,6 +317,9 @@ class _FakeHttp:
         return _FakeResponse(text=self._html)
 
     def post(self, url: str, **kwargs):
+        if url.endswith("/sentinel/ping"):
+            self.pings.append({"url": url, **kwargs})
+            return _FakeResponse(payload={"status": "ok"})
         self.posts.append({"url": url, "headers": kwargs.get("headers") or {}, "json": kwargs.get("json")})
         return _FakeResponse(payload=self.payload)
 
@@ -484,7 +488,7 @@ def test_create_checkout_sends_sentinel(monkeypatch: pytest.MonkeyPatch) -> None
     assert body["plan_name"] == "chatgptplusplan"
     assert body["checkout_source"] == "chatgpt_web_merged"
     assert body["purchase_attempt_id"]
-    assert body["cancel_url"] == "https://chatgpt.com/?cta_tab=personal"
+    assert body["cancel_url"] == "https://chatgpt.com/settings/billing?source=chatgpt_web_merged#pricing"
     assert created.processor_entity == "openai_llc"
     assert created.checkout_url == "https://chatgpt.com/checkout/openai_llc/cs_test_1"
     assert "stripe_session_id=cs_test_1" in created.confirm_return_url

@@ -4,6 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
 const { makePythonCurlFetch, boundedFetch } = require('../../packages/core/src/gss_core/sentinel_assets/sentinel_transport.js');
 
 async function withServer(handler, run) {
@@ -78,4 +79,46 @@ test('helper curl timeout is classified without leaking traceback credentials', 
     await assert.rejects(request('https://public.invalid'), error =>
       error.code === 'network_timeout' && !error.message.includes('secret'));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('helper receives the main client browser target and proxy unchanged', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gss-profile-'));
+  const helper = path.join(dir, 'profile.cjs');
+  fs.writeFileSync(helper, `let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
+    process.stdout.write(JSON.stringify({status:200,body:input}));
+  });`);
+  try {
+    const request = makePythonCurlFetch({ python: process.execPath, helper, timeoutMs: 2000,
+      proxy: 'http://fixture.invalid:3010', impersonate: 'chrome150' });
+    const sent = await (await request('https://upstream.invalid/', { headers: { 'user-agent': 'fixture-browser' } })).json();
+    assert.equal(sent.impersonate, 'chrome150');
+    assert.equal(sent.proxy, 'http://fixture.invalid:3010');
+    assert.equal(sent.headers['user-agent'], 'fixture-browser');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Sentinel navigator high entropy values match the HTTP client hints', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../../packages/core/src/gss_core/sentinel_assets/sentinel_bootstrap.js'), 'utf8');
+  const context = {
+    __UA__: 'Mozilla/5.0 Chrome/150.0.7871.189 Safari/537.36', __PLATFORM__: 'Win32',
+    __PLATFORM_LABEL__: 'Windows', __LANGUAGE__: 'en-PH', __CORES__: 8,
+    __CLIENT_HINTS__: {
+      'sec-ch-ua': '"Google Chrome";v="150", "Chromium";v="150", "Not(A:Brand";v="24"',
+      'sec-ch-ua-platform': '"Windows"', 'sec-ch-ua-platform-version': '"10.0.0"',
+      'sec-ch-ua-full-version-list': '"Google Chrome";v="150.0.7871.189", "Chromium";v="150.0.7871.189", "Not(A:Brand";v="24.0.0.0"',
+      'sec-ch-ua-arch': '"x86"', 'sec-ch-ua-bitness': '"64"', 'sec-ch-ua-model': '""',
+    },
+    setTimeout, clearTimeout, setInterval, clearInterval, URL, TextEncoder, TextDecoder,
+  };
+  vm.createContext(context);
+  vm.runInContext(source, context);
+  const values = await context.navigator.userAgentData.getHighEntropyValues();
+  assert.equal(values.platform, 'Windows');
+  assert.equal(values.uaFullVersion, '150.0.7871.189');
+  assert.equal(values.platformVersion, '10.0.0');
+  assert.equal(values.architecture, 'x86');
+  assert.equal(values.bitness, '64');
+  assert.equal(values.fullVersionList[0].version, '150.0.7871.189');
+  assert.equal(values.brands[2].brand, 'Not(A:Brand');
+  assert.equal(context.navigator.language, 'en-PH');
 });

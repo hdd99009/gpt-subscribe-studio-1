@@ -154,10 +154,35 @@
   navigator.locks = { request: noopPromise, query: function () { return Promise.resolve({ held: [], pending: [] }); } };
   navigator.mediaCapabilities = { decodingInfo: function () { return Promise.resolve({ supported: true, smooth: true, powerEfficient: true }); } };
   (function () {
-    var m = String(g.__UA__ || "").match(/Chrome\/(\d+)\./);
-    var ver = m ? m[1] : "136";
-    var plat = (g.__PLATFORM_LABEL__ || "Windows");
-    navigator.userAgentData = { brands: [{ brand: "Google Chrome", version: ver }, { brand: "Chromium", version: ver }, { brand: "Not.A/Brand", version: "99" }], mobile: false, platform: plat, getHighEntropyValues: function () { return Promise.resolve({ platform: plat, platformVersion: (plat === "Windows" ? "10.0.0" : (plat === "macOS" ? "14.6.1" : "")), fullVersionList: [{ brand: "Google Chrome", version: ver }, { brand: "Chromium", version: ver }, { brand: "Not.A/Brand", version: "99" }] }); } };
+    var match = String(g.__UA__ || "").match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
+    var build = match ? match[1] : "150.0.0.0";
+    var major = build.split(".")[0];
+    var hints = g.__CLIENT_HINTS__ || {};
+    function hint(name, fallback) {
+      return name in hints ? String(hints[name]).replace(/^"|"$/g, "") : fallback;
+    }
+    function brands(name, version) {
+      var entries = [], expression = /"([^"]+)";v="([^"]+)"/g, item;
+      while ((item = expression.exec(hints[name] || ""))) entries.push({ brand: item[1], version: item[2] });
+      return entries.length ? entries : [
+        { brand: "Google Chrome", version: version },
+        { brand: "Chromium", version: version },
+        { brand: "Not(A:Brand", version: version === major ? "24" : "24.0.0.0" }
+      ];
+    }
+    var platform = hint("sec-ch-ua-platform", g.__PLATFORM_LABEL__ || "Windows");
+    var platformVersion = hint("sec-ch-ua-platform-version",
+      platform === "Windows" ? "10.0.0" : (platform === "macOS" ? "14.6.1" : ""));
+    navigator.userAgentData = {
+      brands: brands("sec-ch-ua", major), mobile: false, platform: platform,
+      getHighEntropyValues: function () {
+        return Promise.resolve({ brands: this.brands, mobile: false, platform: platform,
+          platformVersion: platformVersion, uaFullVersion: build,
+          fullVersionList: brands("sec-ch-ua-full-version-list", build),
+          architecture: hint("sec-ch-ua-arch", "x86"), bitness: hint("sec-ch-ua-bitness", "64"),
+          model: hint("sec-ch-ua-model", ""), wow64: false });
+      }
+    };
   })();
   navigator.scheduling = { isInputPending: function () { return false; } };
   navigator.ink = { requestPresenter: noopPromise };

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -16,6 +17,8 @@ from urllib.parse import quote, urlencode
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.countries import currency_for, locale_for, timezone_for
+from gss_core.har_device import _detect_os
+from gss_core.har_telemetry import sentinel_timing
 from gss_core.money import quote_from_payload
 from gss_core.redaction import redact_sensitive
 from gss_core.sentinel import extract_attestation, extract_build, header_value, mint, so_header_value
@@ -28,6 +31,7 @@ from gss_core.session_token import (
 )
 
 APP_BASE = "https://chatgpt.com"
+CHECKOUT_PAGE = f"{APP_BASE}/settings/billing?source=chatgpt_web_merged"
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
 STRIPE_BASE = "https://api.stripe.com"
 _IMPERSONATE = "chrome150"
@@ -82,12 +86,10 @@ _PROFILES = {
         "ua": ("Mozilla/5.0 (X11; Linux x86_64) "
                "AppleWebKit/537.36 (KHTML, like Gecko) "
                "Chrome/{build} Safari/537.36"),
-        "hints": {"sec-ch-ua-platform": '"Linux"'},
+        "hints": {"sec-ch-ua-platform": '"Linux"', "sec-ch-ua-platform-version": '""',
+                  "sec-ch-ua-arch": '"x86"', "sec-ch-ua-bitness": '"64"'},
     },
 }
-
-# 加权：Windows 占真实用户多数
-_PROFILE_ORDER = ["windows", "windows", "windows", "macos", "macos", "linux"]
 
 
 def _hash8(seed: str, salt: str = "") -> int:
@@ -96,12 +98,15 @@ def _hash8(seed: str, salt: str = "") -> int:
 
 
 def _pick_profile(device_id: str) -> dict:
-    """按 device_id 稳定选定平台与版本，同一账号永远同一组合。"""
+    """Use the configured/host platform and a build matching the transport major."""
     seed = str(device_id or "anon")
-    key = _PROFILE_ORDER[_hash8(seed, "os") % len(_PROFILE_ORDER)]
+    key = os.environ.get("GSS_DEVICE_OS") or _detect_os()
+    if key not in _PROFILES:
+        key = _detect_os()
     prof = dict(_PROFILES[key])
     prof["key"] = key
-    prof["build"] = prof["builds"][_hash8(seed, "b") % len(prof["builds"])]
+    builds = [build for build in prof["builds"] if build.startswith("150.")]
+    prof["build"] = builds[_hash8(seed, "b") % len(builds)]
     return prof
 
 
@@ -385,7 +390,7 @@ def _checkout_body(
         "checkout_source": "chatgpt_web_merged",
         "supports_saved_payment_link": True,
         "checkout_appearance": "light",
-        "cancel_url": f"{APP_BASE}/?cta_tab=personal",
+        "cancel_url": f"{CHECKOUT_PAGE}#pricing",
         "purchase_attempt_id": str(uuid.uuid4()),
         "checkout_ui_mode": "custom",
     }
@@ -452,6 +457,7 @@ def jwt_account_id(access_token: str) -> str:
 
 def _new_session(*, proxy: Optional[str], timeout: float, impersonate: str = _IMPERSONATE):
     try:
+        from curl_cffi import CurlInfo
         from curl_cffi.requests import Session as CurlSession
     except ImportError as exc:  # pragma: no cover
         raise DomainError(
@@ -459,9 +465,11 @@ def _new_session(*, proxy: Optional[str], timeout: float, impersonate: str = _IM
             "缺少 curl_cffi，无法用浏览器指纹请求 ChatGPT",
         ) from exc
     try:
-        session = CurlSession(impersonate=impersonate, timeout=timeout)
+        session = CurlSession(impersonate=impersonate, timeout=timeout,
+                              curl_infos=[CurlInfo.PRETRANSFER_TIME, CurlInfo.STARTTRANSFER_TIME])
     except Exception:
-        session = CurlSession(impersonate="chrome150", timeout=timeout)
+        session = CurlSession(impersonate="chrome150", timeout=timeout,
+                              curl_infos=[CurlInfo.PRETRANSFER_TIME, CurlInfo.STARTTRANSFER_TIME])
     if hasattr(session, "trust_env"):
         session.trust_env = False
     proxy = str(proxy or "").strip()
@@ -486,6 +494,7 @@ class ChatGPTClient:
     timezone: str = "America/New_York"
     sentinel_token: str = ""
     sentinel_so: str = ""
+    sentinel_telemetry: str = "[1,null]"
     _http: Any = field(default=None, repr=False)
     _stripe_http: Any = field(default=None, repr=False)
     _stripe_js_id: str = field(default="", repr=False)
@@ -543,7 +552,16 @@ class ChatGPTClient:
         p = self.profile
         return {"platform": p["platform"], "platform_label": p["label"],
                 "screen_w": p["screen"][0], "screen_h": p["screen"][1],
-                "avail_h": p["screen"][2], "cores": 8}
+                "avail_h": p["screen"][2], "cores": 8,
+                "impersonate": _IMPERSONATE, "client_hints": self.client_hints}
+
+    @property
+    def client_hints(self) -> dict:
+        full_versions = (f'"Google Chrome";v="{self.chrome_build}", '
+                         f'"Chromium";v="{self.chrome_build}", "Not(A:Brand";v="24.0.0.0"')
+        return {"sec-ch-ua": self.sec_ch_ua, "sec-ch-ua-mobile": "?0", **self.profile["hints"],
+                "sec-ch-ua-full-version": f'"{self.chrome_build}"',
+                "sec-ch-ua-full-version-list": full_versions, "sec-ch-ua-model": '""'}
 
     def _identity_headers(self) -> Dict[str, str]:
         headers = {
@@ -557,16 +575,14 @@ class ChatGPTClient:
             "oai-did": self.device_id,
             "oai-device-id": self.device_id,
             "oai-language": self.language,
-            "oai-telemetry": "production",
+            "oai-telemetry": self.sentinel_telemetry,
             "oai-session-id": self.oai_session_id,
             "oai-client-version": self.client_version,
             "oai-client-build-number": self.client_build_number,
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "sec-ch-ua": self.sec_ch_ua,
-            "sec-ch-ua-mobile": "?0",
-            **self.profile["hints"],
+            **self.client_hints,
             "Cookie": self._cookie_header(),
         }
         if not self.access_token:
@@ -584,6 +600,7 @@ class ChatGPTClient:
         }
         if route.startswith("/backend-api/payments/"):
             headers.update(_CODEX_WEB_HEADERS)
+            headers["oai-telemetry"] = self.sentinel_telemetry
         if route in ("/backend-api/subscriptions", "/backend-api/subscriptions/cancel"):
             headers.update(self._identity_headers())
             for name in ("originator", "x-openai-web-frontend", "x-openai-codex-window-type"):
@@ -789,6 +806,29 @@ class ChatGPTClient:
         url = page_url or f"{APP_BASE}/"
         self.warmup(page_url=url)
         self.mint_sentinel(flow=flow, page_url=url)
+        self.measure_sentinel_ping()
+
+    def measure_sentinel_ping(self) -> None:
+        self.sentinel_telemetry = "[1,null]"
+        started = time.perf_counter()
+        try:
+            response = self.http.post(
+                f"{APP_BASE}/backend-api/sentinel/ping",
+                data=b"",
+                headers={"Referer": f"{APP_BASE}/", "Cache-Control": "no-store",
+                         "Authorization": None, "chatgpt-account-id": None,
+                         "Content-Type": None, "oai-telemetry": None},
+                timeout=min(self.timeout, 10.0),
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.sentinel_telemetry = sentinel_timing(response, elapsed_ms=elapsed_ms)
+            self._merge_cookies(response)
+            logger.info("sentinel_ping http=%s timing_available=%s", response.status_code,
+                        self.sentinel_telemetry != "[1,null]")
+        except Exception as exc:
+            logger.warning("sentinel_ping_failed type=%s", type(exc).__name__)
+        if self._http is not None:
+            self._http.headers.update({"oai-telemetry": self.sentinel_telemetry})
 
     @property
     def http(self):
@@ -937,11 +977,10 @@ class ChatGPTClient:
         currency = currency_for(country)
         hosted = str(plan) == "team"
         campaign_id = str(promo_campaign_id or "").strip()[:120]
-        page_url = (
-            f"{APP_BASE}/?promo_campaign={quote(campaign_id or 'plus-1-month-free', safe='')}"
-            if promo or campaign_id
-            else f"{APP_BASE}/"
-        )
+        page_url = f"{APP_BASE}/" if hosted else CHECKOUT_PAGE
+        if promo or campaign_id:
+            separator = "&" if "?" in page_url else "?"
+            page_url += f"{separator}promo_campaign={quote(campaign_id or 'plus-1-month-free', safe='')}"
         self.prepare_risk(flow="chatgpt_checkout", page_url=page_url, country=country)
         if not self.account_id:
             self.hydrate()

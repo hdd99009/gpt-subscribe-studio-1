@@ -530,6 +530,31 @@ def sentinel_ping(http: Any, device: DeviceProfile, *, timeout: float = 10.0) ->
         pass
 
 
+def sentinel_timing(response: Any, *, elapsed_ms: float) -> str:
+    """Build the SDK timing vector from this ping's headers and curl timings."""
+    import math
+    from curl_cffi import CurlInfo
+
+    if int(getattr(response, "status_code", 0) or 0) != 200:
+        return "[1,null]"
+    infos = getattr(response, "infos", {}) or {}
+    headers = getattr(response, "headers", {}) or {}
+    protocol = {1: 1, 2: 1, 3: 2, 30: 3, 31: 3}.get(getattr(response, "http_version", 0), 0)
+    rtt_header = "s-cf-quic-rtt-msec" if protocol == 3 else "s-cf-tcp-rtt-msec"
+    try:
+        ttfb_ms = (float(infos[CurlInfo.STARTTRANSFER_TIME]) - float(infos[CurlInfo.PRETRANSFER_TIME])) * 1000
+        edge_ms = float(headers["s-cf-edge-msec"])
+        origin_ms = float(headers["s-cf-origin-ttfb-msec"])
+        rtt_ms = float(headers[rtt_header])
+        values = [ttfb_ms, edge_ms, origin_ms, rtt_ms, elapsed_ms]
+        if not all(math.isfinite(value) and value >= 0 for value in values):
+            return "[1,null]"
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return "[1,null]"
+    return json.dumps([1, round(ttfb_ms, 3), edge_ms, origin_ms, rtt_ms, protocol, 0, round(elapsed_ms)],
+                      separators=(",", ":"))
+
+
 def catalog_info() -> Dict[str, Any]:
     return dict(_catalog()["source"])
 
@@ -538,6 +563,7 @@ __all__ = [
     "StripeTelemetry",
     "TelemetryContext",
     "sentinel_ping",
+    "sentinel_timing",
     "catalog_info",
     "PHASE_ELEMENTS",
     "PHASE_CAPTCHA",

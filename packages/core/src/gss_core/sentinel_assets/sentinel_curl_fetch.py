@@ -16,16 +16,17 @@ from curl_cffi import requests
 
 
 def handle(payload: dict) -> dict:
-    """与历史实现逐字段一致的请求逻辑。"""
-    response = requests.request(
-        method=str(payload.get("method") or "GET"),
-        url=str(payload.get("url") or ""),
-        headers={str(k): str(v) for k, v in (payload.get("headers") or {}).items()},
-        data=payload.get("body") if payload.get("body") is not None else None,
-        proxy=str(payload.get("proxy") or "") or None,
-        timeout=float(payload.get("timeout") or 120),
-        impersonate="chrome136",
-    )
+    """Send with the same explicit proxy and browser target as the calling client."""
+    with requests.Session(trust_env=False) as session:
+        response = session.request(
+            method=str(payload.get("method") or "GET"),
+            url=str(payload.get("url") or ""),
+            headers={str(k): str(v) for k, v in (payload.get("headers") or {}).items()},
+            data=payload.get("body") if payload.get("body") is not None else None,
+            proxy=str(payload.get("proxy") or "") or None,
+            timeout=float(payload.get("timeout") or 120),
+            impersonate=str(payload.get("impersonate") or "chrome150"),
+        )
     return {
         "status": int(response.status_code),
         "body": response.text,

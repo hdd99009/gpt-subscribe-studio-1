@@ -171,10 +171,8 @@ function solvePoW(g, seed, difficulty) {
   return "gAAAAAB" + ERR_PREFIX + b64Compact(null) + "~S";
 }
 
-function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOrigin, frameUrl) {
-  // sdk 里的 fetch 桥到 fetchImpl：改写 URL 到 sentinel.openai.com、补头、走代理。
-  // 关键：dispatcher 与 fetchImpl 必须来自同一个 undici 版本，否则 Node 内置 fetch
-  // 校验外部 dispatcher 的 Request handler 会报 "invalid onRequestStart method"。
+function makeFetch(ua, language, cookieHeader, fetchImpl, sentinelOrigin, frameUrl, clientHints) {
+  // Keep SDK requests on the main client's browser identity and selected proxy.
   return function (url, opts) {
     opts = opts || {};
     let u = String(url);
@@ -193,11 +191,11 @@ function makeFetch(ua, language, cookieHeader, dispatcher, fetchImpl, sentinelOr
         "accept-language": `${language},${language.split("-")[0]};q=0.9,en;q=0.8`,
         ...(cookieHeader ? { cookie: cookieHeader } : {}),
       },
+      clientHints,
       opts.headers || {}
     );
     const fopts = { method: opts.method || "GET", headers };
     if (opts.body != null) fopts.body = opts.body;
-    if (dispatcher) fopts.dispatcher = dispatcher;
     return fetchImpl(u, fopts);
   };
 }
@@ -285,7 +283,7 @@ function curlDaemonSockets() {
 
 let curlDaemonCursor = 0;
 
-function residentCurlFetch(proxy, url, opts, timeoutMs) {
+function residentCurlFetch(proxy, url, opts, timeoutMs, impersonate) {
   const sockets = curlDaemonSockets();
   if (!sockets.length) return null;
   const net = require("net");
@@ -315,6 +313,7 @@ function residentCurlFetch(proxy, url, opts, timeoutMs) {
           headers: opts.headers || {},
           body: opts.body == null ? null : String(opts.body),
           proxy,
+          impersonate,
           timeout: timeoutMs / 1000,
         }));
       } catch (e) {
@@ -339,6 +338,8 @@ function residentCurlFetch(proxy, url, opts, timeoutMs) {
           status,
           ok: status >= 200 && status < 300,
           headers: { get: () => null },
+          _debugHeaders: result.headers || {},
+          _debugRequestHeaders: result.request_headers || {},
           text: async () => body,
           json: async () => JSON.parse(body),
         });
@@ -354,14 +355,14 @@ function curlDaemonCursorSafe() {
   return curlDaemonCursor;
 }
 
-function makePythonCurlFetch(proxy, timeoutMs, onFailure) {
+function makePythonCurlFetch(proxy, timeoutMs, onFailure, impersonate) {
   const helper = require("path").join(__dirname, "sentinel_curl_fetch.py");
   const python = resolvePython();
-  const spawnCurlFetch = transport.makePythonCurlFetch({ python, helper, proxy, timeoutMs, onFailure });
+  const spawnCurlFetch = transport.makePythonCurlFetch({ python, helper, proxy, timeoutMs, impersonate, onFailure });
 
   return function pythonCurlFetch(url, opts) {
     opts = opts || {};
-    const viaDaemon = residentCurlFetch(proxy, url, opts, timeoutMs);
+    const viaDaemon = residentCurlFetch(proxy, url, opts, timeoutMs, impersonate);
     if (!viaDaemon) return spawnCurlFetch(url, opts);
     return viaDaemon.catch(() => spawnCurlFetch(url, opts));
   };
@@ -404,40 +405,9 @@ async function handleRequest(raw) {
   const maxTouch = args.maxTouchPoints ? 1 : 0;
   const frameUrl = `${sentinelOrigin}/backend-api/sentinel/frame.html?sv=${version}`;
 
-  // fetch + ProxyAgent 必须同源（同一 undici 版本）。优先用 npm undici；
-  // 无代理且 undici 缺失时退回 Node 内置全局 fetch。
-  let undici = null;
-  try {
-    undici = require("undici");
-  } catch (_) {}
-
-  // 代理（undici ProxyAgent）——与注册同 IP 命中 /sentinel/req。
-  // 注意：undici 不会自动解析 URL 里的 user:pass@，必须显式给 Proxy-Authorization token。
-  let dispatcher = null;
-  let fetchImpl = undici && undici.fetch ? undici.fetch : fetch;
-  if (proxy) {
-    if (undici && /^https?:/i.test(proxy)) {
-      try {
-        const pu = new URL(proxy);
-        const opts = { uri: pu.origin }; // http://host:port（去掉 userinfo）
-        if (pu.username || pu.password) {
-          const auth = decodeURIComponent(pu.username) + ":" + decodeURIComponent(pu.password);
-          opts.token = "Basic " + Buffer.from(auth, "utf8").toString("base64");
-        }
-        dispatcher = new undici.ProxyAgent(opts);
-      } catch (e) {
-        return JSON.stringify({ error: "ProxyAgent 构造失败：" + ((e && e.message) || e) });
-      }
-    } else {
-      // SOCKS 代理在 Windows 系统 curl/Schannel 下会出现
-      // SEC_E_NO_CREDENTIALS；复用项目 curl_cffi 的 BoringSSL TLS 栈。
-      fetchImpl = makePythonCurlFetch(proxy, timeoutMs, onNetworkFailure);
-    }
-  }
-
-  if (!proxy || /^https?:/i.test(proxy)) {
-    fetchImpl = transport.boundedFetch(fetchImpl, timeoutMs, onNetworkFailure);
-  }
+  const clientHints = args.clientHints || {};
+  const impersonate = args.impersonate || "chrome150";
+  let fetchImpl = makePythonCurlFetch(proxy, timeoutMs, onNetworkFailure, impersonate);
   fetchImpl = require("./http_debug.js").captureFetch(fetchImpl, args.debugCapture, proxy);
 
   const assetsDir = __dirname;
@@ -457,10 +427,10 @@ async function handleRequest(raw) {
       ua,
       language,
       cookieHeader,
-      dispatcher,
       fetchImpl,
       sentinelOrigin,
-      frameUrl
+      frameUrl,
+      clientHints
     ),
     TextEncoder,
     TextDecoder,
@@ -470,6 +440,7 @@ async function handleRequest(raw) {
     URL,
     URLSearchParams,
     __UA__: ua,
+    __CLIENT_HINTS__: clientHints,
     __CORES__: cores,
     __SDK_URL__: `${sentinelOrigin}/sentinel/${version}/sdk.js`,
     __SEED_DID_KEY__: "oai-did",
@@ -510,9 +481,6 @@ async function handleRequest(raw) {
     rawDriver = await Promise.resolve(p);
   } catch (e) {
     return JSON.stringify({ error: "proto2: " + (e && e.stack || e), reason: networkFailure });
-  } finally {
-    // No more network work is needed once the SDK resolves or rejects.
-    if (dispatcher && typeof dispatcher.destroy === "function") await dispatcher.destroy().catch(() => {});
   }
 
   let rd;

@@ -18,7 +18,7 @@ from gss_contracts import (
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
-from gss_core.countries import country_codes, currency_for
+from gss_core.countries import country_codes, currency_for, locale_for, timezone_for
 from gss_core.proxies import align_proxy_region, configured_proxy, rotate_proxy_sid, session_proxy
 
 logger = logging.getLogger("gss.checkout")
@@ -164,6 +164,8 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     def _create(self, req: CheckoutRequest, proxy: Optional[str]):
         client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
         client.timeout = float(self.timeout)
+        client.language = locale_for(req.billing_country)
+        client.timezone = timezone_for(req.billing_country)
         # 出口已对齐账单国：先用同一出口刷新 session，让 accessToken/cookie 与
         # 本次 IP 同批次，降低 403 与 unusual activity 概率。软失败不阻断。
         client.refresh_session()
