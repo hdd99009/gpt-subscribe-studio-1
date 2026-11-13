@@ -27,6 +27,7 @@ import { randomBillingExample } from "../card-payment/billingExamples";
 
 interface Props {
   orderId: string;
+  plan?: string;
   bindBeforePay?: boolean;
   browserPayment?: boolean;
   submissionDisabled?: boolean;

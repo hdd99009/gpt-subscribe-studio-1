@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from gss_api.main import create_app
 from gss_api.store import store
 from gss_contracts.errors import DomainError, ErrorCode
-from gss_contracts import CheckoutResult, Plan
+from gss_contracts import CheckoutResult
+
+
+pytestmark = pytest.mark.parametrize("plan", ["plus", "go"])
 
 
 BILLING = {"name": "Fixture Holder", "email": "fixture@example.invalid", "line1": "1 Fixture Street",
@@ -23,13 +26,14 @@ def client(monkeypatch, tmp_path):
     store.clear()
 
 
-def test_create_order_retains_manual_billing_through_pipeline(client):
+def test_create_order_retains_manual_billing_through_pipeline(client, plan):
     billing = {**BILLING, "name": " Fixture Holder ", "country": "ph"}
-    response = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": "plus",
+    response = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": plan,
                                                "billing_country": "PH", "billing": billing})
     assert response.status_code == 201, response.text
     order = response.json()
     assert order["billing"] == BILLING
+    assert order["plan"] == plan
     assert order["billing_country"] == "PH" and order["currency"] == "PHP"
     assert order["status"] == "awaiting_payment"
     assert client.get('/api/orders/' + order['id']).json()["billing"] == BILLING
@@ -37,20 +41,20 @@ def test_create_order_retains_manual_billing_through_pipeline(client):
 
 @pytest.mark.parametrize("billing", [{**BILLING, "line1": "   "}, {**BILLING, "country": "ZZ"},
                                      {**BILLING, "country": "US", "state": ""}])
-def test_invalid_manual_address_does_not_create_order(client, billing):
-    response = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": "plus",
+def test_invalid_manual_address_does_not_create_order(client, billing, plan):
+    response = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": plan,
                                                "billing_country": "PH", "billing": billing})
     assert response.status_code == 400
     assert store.orders == {}
 
 
-def test_created_checkout_with_missing_quote_still_enters_payment_page(client, monkeypatch):
+def test_created_checkout_with_missing_quote_still_enters_payment_page(client, monkeypatch, plan):
     async def checkout(req):
         return CheckoutResult(checkout_url="https://chatgpt.com/checkout/openai_llc/oaics_fixture",
-                              checkout_session_id="oaics_fixture", plan=Plan.PLUS, currency="PHP", amount=None,
+                              checkout_session_id="oaics_fixture", plan=req.plan, currency="PHP", amount=None,
                               billing=req.billing, quote_error="报价暂未取得")
     monkeypatch.setattr("gss_checkout.adapter.FakeCheckoutAdapter.create_checkout", lambda self, req: checkout(req))
-    response = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": "plus",
+    response = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": plan,
                                                "billing_country": "PH", "billing": BILLING})
     assert response.status_code == 201
     order = response.json()
@@ -60,8 +64,8 @@ def test_created_checkout_with_missing_quote_still_enters_payment_page(client, m
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_refresh_quote_reuses_checkout_and_billing_without_payment(client, monkeypatch, fail):
-    order = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": "plus",
+def test_refresh_quote_reuses_checkout_and_billing_without_payment(client, monkeypatch, fail, plan):
+    order = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": plan,
                                             "billing_country": "PH", "billing": BILLING}).json()
     from gss_core.vault import vault
     secrets = vault.get(order["id"])
@@ -87,8 +91,8 @@ def test_refresh_quote_reuses_checkout_and_billing_without_payment(client, monke
     assert calls == ["quote", "closed"]
 
 
-def test_refresh_quote_cannot_run_after_payment_processing_started(client, monkeypatch):
-    order = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": "plus",
+def test_refresh_quote_cannot_run_after_payment_processing_started(client, monkeypatch, plan):
+    order = client.post("/api/orders", json={"session": '{"accessToken":"fixture"}', "plan": plan,
                                             "billing_country": "PH", "billing": BILLING}).json()
     from gss_core.vault import vault
     vault.get(order["id"]).saved_card_context = {"protocol_flow": True}

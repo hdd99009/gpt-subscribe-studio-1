@@ -122,3 +122,34 @@ class ErrorOut(BaseModel):
     code: str
     message: str
     detail: Optional[Dict[str, Any]] = None
+
+
+class MemoryOrderOut(BaseModel):
+    id: str
+    status: str
+    plan: str
+    billing_country: str
+    created_at: str
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    session_email: Optional[str] = None
+    card_last4: Optional[str] = Field(default=None, pattern=r"^\d{4}$")
+    payment_confirmed: bool = False
+    renewal: Optional[RenewalOut] = None
+    last_error: Optional[str] = None
+    deletion_blocked_reason: Optional[str] = None
+
+
+class MemoryOrdersClearRequest(BaseModel):
+    order_ids: list[str] = Field(min_length=1)
+
+
+class MemoryOrderSkipped(BaseModel):
+    id: str
+    reason: str
+
+
+class MemoryOrdersClearOut(BaseModel):
+    deleted_ids: list[str]
+    missing_ids: list[str]
+    skipped: list[MemoryOrderSkipped]

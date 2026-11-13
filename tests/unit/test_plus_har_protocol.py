@@ -32,6 +32,7 @@ class FakeResponse:
 
 
 class StubClient:
+    plan = "plus"
     access_token = "token_fixture"
     account_id = "account_fixture"
     device_id = "did_fixture"
@@ -50,7 +51,7 @@ class StubClient:
         return None
 
     def subscription_payload(self):
-        return {"plan_type": "plus", "is_active": True,
+        return {"plan_type": self.plan, "is_active": True,
                 "entitlement": {"has_active_subscription": True}}
 
     def retrieve_stripe_intent(self, **kwargs):
@@ -61,7 +62,8 @@ class StubClient:
 
 
 class FakeApp:
-    def __init__(self):
+    def __init__(self, plan="plus"):
+        self.plan = plan
         self.calls = []
         self.page_status = "open"
 
@@ -75,7 +77,7 @@ class FakeApp:
                 "processor_entity": PROCESSOR,
                 "customer_session_client_secret": "cuss_fixture",
                 "confirm_return_url": ("https://chatgpt.com/checkout/verify?"
-                                       f"stripe_session_id={CHECKOUT_ID}&processor_entity={PROCESSOR}&plan_type=plus"),
+                                       f"stripe_session_id={CHECKOUT_ID}&processor_entity={PROCESSOR}&plan_type={self.plan}"),
                 "status": self.page_status,
                 "payment_status": "paid" if self.page_status == "complete" else "unpaid",
                 "checkout_state": {"currency": "jpy", "total": {"total": {"minorUnitsAmount": 1499}}},
@@ -93,7 +95,7 @@ class FakeApp:
                 "type": "payment_intent",
                 "client_secret": "pi_fixture_secret_fixture",
                 "confirm_return_url": ("https://chatgpt.com/checkout/verify?"
-                                       f"stripe_session_id={CHECKOUT_ID}&processor_entity={PROCESSOR}&plan_type=plus"),
+                                       f"stripe_session_id={CHECKOUT_ID}&processor_entity={PROCESSOR}&plan_type={self.plan}"),
             })
         if route == "/backend-api/payments/checkout_session":
             return FakeResponse({"success": True, "created_new_subscription": False})
@@ -152,13 +154,14 @@ class FakeTelemetry:
 class Harness(PlusHarProtocol):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.app = FakeApp()
+        self.app = FakeApp(plan=self.plan)
         self.stripe = FakeStripe()
         self.sentinel_flows = []
         self.order = []
 
     def _prepare(self):
         self.client = StubClient()
+        self.client.plan = self.plan
         self.telemetry = FakeTelemetry(SimpleNamespace(amount=0, customer_id="", hcaptcha_token=""))
         self.order.append(("prepare",))
 
@@ -239,12 +242,14 @@ def test_verified_intent_is_retained_if_post_payment_processing_fails(monkeypatc
     assert context["payment_confirmed"] is True
 
 
-def test_flow_order_matches_capture():
-    engine = build_harness()
+@pytest.mark.parametrize("plan", ["plus", "go"])
+def test_flow_order_matches_capture(plan):
+    engine = build_harness(plan=plan)
     result = engine.pay()
 
     assert result.state == "paid"
     assert result.intent_status == "succeeded"
+    assert result.message == f"{plan.title()} 订阅已生效"
 
     steps = [(item[0], item[1] if len(item) > 1 else "") for item in engine.order]
     expected = [
@@ -367,12 +372,14 @@ def test_read_only_never_posts_payment(monkeypatch):
     assert posts == []
 
 
-def test_run_har_context_persists_device_and_ids(monkeypatch):
+@pytest.mark.parametrize("plan", ["plus", "go"])
+def test_run_har_context_persists_device_and_ids(monkeypatch, plan):
     calls = {}
 
     def fake_pay(self):
         calls["device"] = self.device.to_dict()
         calls["stripe_direct"] = self.stripe_direct
+        calls["plan"] = self.plan
         self.ctoken = "ctoken_ctx"
         self.intent_id = "pi_ctx"
         self.intent_secret = "pi_ctx_secret"
@@ -384,6 +391,7 @@ def test_run_har_context_persists_device_and_ids(monkeypatch):
     monkeypatch.setattr(PlusHarProtocol, "pay", fake_pay)
     context = {}
     spec = {
+        "plan": plan,
         "checkout_url": f"https://chatgpt.com/checkout/{PROCESSOR}/{CHECKOUT_ID}",
         "checkout_id": CHECKOUT_ID,
         "publishable_key": "pk_live_fixture",
@@ -404,6 +412,18 @@ def test_run_har_context_persists_device_and_ids(monkeypatch):
     assert context["amount_minor"] == 1363
     assert context["app_confirmation_started"] is True
     assert calls["stripe_direct"] is True
+    assert calls["plan"] == plan
+
+
+@pytest.mark.parametrize("plan", ["plus", "go"])
+def test_har_settlement_does_not_accept_another_subscription_plan(plan):
+    engine = build_harness(plan=plan)
+    engine._prepare()
+    engine.client.plan = "go" if plan == "plus" else "plus"
+    engine.app.page_status = "complete"
+    result = engine._settle()
+    assert result.state == "pending"
+    assert result.message == f"付款已确认，等待 {plan.title()} 订阅生效"
 
 
 def test_elements_session_parses_live_body():

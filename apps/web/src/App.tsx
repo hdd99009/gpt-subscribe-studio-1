@@ -6,10 +6,13 @@ import { loadHistory, recordOrder } from "./api/history";
 import type { Order } from "./api/client";
 import { HistoryTable } from "./components/HistoryTable";
 import { ProxySettings } from "./components/ProxySettings";
+import { MemoryOrders } from "./components/MemoryOrders";
 import { OrderNew } from "./pages/OrderNew";
 
 export function App() {
   const [history, setHistory] = useState(loadHistory);
+  const [tab, setTab] = useState<string | null>("order");
+  const [clearedOrderIds, setClearedOrderIds] = useState<string[]>([]);
   const { colorScheme, toggleColorScheme } = useMantineColorScheme();
   const record = useCallback((order: Order) => setHistory(recordOrder(order)), []);
 
@@ -19,7 +22,7 @@ export function App() {
   }
 
   return (
-    <Container size={1040} py="xl" className="studio-container">
+    <Container size={tab === "memory" ? 1560 : 1040} py="xl" className="studio-container">
       <Group justify="space-between" align="center" mb="lg">
         <div>
           <Title order={2}>gpt-subscribe-studio</Title>
@@ -41,7 +44,7 @@ export function App() {
         </Group>
       </Group>
 
-      <Tabs defaultValue="order" keepMounted>
+      <Tabs value={tab} onChange={setTab} keepMounted>
         <Tabs.List mb="lg">
           <Tabs.Tab value="order" leftSection={<IconReceipt size={16} />}>
             开通
@@ -56,15 +59,21 @@ export function App() {
           <Tabs.Tab value="proxy" leftSection={<IconNetwork size={16} />}>
             代理设置
           </Tabs.Tab>
+          <Tabs.Tab value="memory" leftSection={<IconReceipt size={16} />}>
+            内存订单
+          </Tabs.Tab>
         </Tabs.List>
         <Tabs.Panel value="order">
-          <OrderNew onRecord={record} />
+          <OrderNew onRecord={record} clearedOrderIds={clearedOrderIds} />
         </Tabs.Panel>
         <Tabs.Panel value="history">
           <HistoryTable items={history} />
         </Tabs.Panel>
         <Tabs.Panel value="proxy">
           <ProxySettings />
+        </Tabs.Panel>
+        <Tabs.Panel value="memory">
+          <MemoryOrders active={tab === "memory"} onCleared={setClearedOrderIds} />
         </Tabs.Panel>
       </Tabs>
 

@@ -63,6 +63,7 @@ router = APIRouter(prefix="/api", tags=["orders"])
 logger = logging.getLogger("gss.orders")
 _team_locks: dict[str, asyncio.Lock] = {}
 _renewal_tasks: dict[str, asyncio.Task] = {}
+_checkout_tasks: dict[str, asyncio.Task] = {}
 
 
 def _assert_saved_card_resolved(secrets: OrderSecrets) -> None:
@@ -335,6 +336,7 @@ async def create_order(
     # 建单重试可能换了 SID —— 用最终生效的出口覆盖，保证支付同出口
 
     pipeline = build_pipeline()
+    _checkout_tasks[order.id] = asyncio.current_task()
     try:
         checkout, exit_proxy = await _create_checkout_with_retry(
             pipeline,
@@ -361,6 +363,8 @@ async def create_order(
             exc.message,
         )
         raise _from_domain(exc)
+    finally:
+        _checkout_tasks.pop(order.id, None)
 
     # 建单最终生效的出口：重试可能换过 SID，支付必须复用
     _s = vault.get(order.id)
@@ -416,8 +420,8 @@ async def create_order(
 @router.post("/orders/{order_id}/quote", response_model=OrderOut)
 async def refresh_checkout_quote(order_id: str) -> OrderOut:
     order = store.get_order(order_id)
-    if order is None or order.plan is not Plan.PLUS:
-        raise HTTPException(404, "Plus 订单不存在")
+    if order is None or order.plan not in {Plan.PLUS, Plan.GO}:
+        raise HTTPException(404, "Plus / Go 订单不存在")
     async with _team_locks.setdefault(order_id, asyncio.Lock()):
         if order.status is not OrderStatus.AWAITING_PAYMENT:
             raise HTTPException(409, "订单已进入付款流程，请查询原订单状态")

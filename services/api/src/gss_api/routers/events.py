@@ -64,6 +64,16 @@ async def _subscribe(order_id: str) -> asyncio.Queue[dict]:
     return q
 
 
+async def close_order_streams(order_id: str) -> None:
+    async with _lock:
+        queues = _subscribers.pop(order_id, set())
+        for queue in queues:
+            while not queue.empty():
+                queue.get_nowait()
+            queue.put_nowait({"type": "deleted", "order_id": order_id,
+                              "status": "deleted", "timestamp": time.time()})
+
+
 async def _unsubscribe(order_id: str, q: asyncio.Queue[dict]) -> None:
     """取消订阅。"""
     async with _lock:
@@ -78,6 +88,10 @@ async def _event_stream(order_id: str, initial_status: str) -> AsyncGenerator[st
     q = await _subscribe(order_id)
     
     try:
+        if store.get_order(order_id) is None:
+            yield _sse({"type": "deleted", "order_id": order_id,
+                        "status": "deleted", "timestamp": time.time()})
+            return
         # 发送初始状态
         yield _sse({"type": "init", "status": initial_status})
         
@@ -86,6 +100,8 @@ async def _event_stream(order_id: str, initial_status: str) -> AsyncGenerator[st
                 # 等待事件，60 秒超时发送心跳
                 event = await asyncio.wait_for(q.get(), timeout=60.0)
                 yield _sse(event)
+                if event.get("type") == "deleted":
+                    return
             except asyncio.TimeoutError:
                 # 心跳：保持连接活跃
                 yield f": heartbeat {time.time()}\n\n"

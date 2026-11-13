@@ -75,6 +75,13 @@ class InMemoryStore:
     def jobs_for_order(self, order_id: str) -> List[Job]:
         return [job for job in self.jobs.values() if job.order_id == order_id]
 
+    def delete_order(self, order_id: str) -> bool:
+        order = self.orders.pop(order_id, None)
+        self.views.pop(order_id, None)
+        self.jobs = {key: job for key, job in self.jobs.items() if job.order_id != order_id}
+        self._idempotency = {key: value for key, value in self._idempotency.items() if value != order_id}
+        return order is not None
+
     def clear(self) -> None:
         self.orders.clear()
         self.jobs.clear()

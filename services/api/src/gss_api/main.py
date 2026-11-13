@@ -11,7 +11,7 @@ from gss_core import install_logging_filter
 from gss_core.config import load_settings, missing_upstreams, use_fake_adapters
 from gss_core.proxies import GatewayStore
 
-from .routers import events, orders, promo, proxies, saved_cards, protocol_cards, sessions
+from .routers import events, orders, promo, proxies, saved_cards, protocol_cards, sessions, memory_orders
 
 __version__ = "0.1.0"
 
@@ -42,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(saved_cards.router)
     app.include_router(protocol_cards.router)
     app.include_router(sessions.router)
+    app.include_router(memory_orders.router)
     app.include_router(promo.router)
     app.include_router(events.router)
     app.state.gateway_store = GatewayStore()

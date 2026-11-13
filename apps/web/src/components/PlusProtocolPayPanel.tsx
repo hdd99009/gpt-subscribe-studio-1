@@ -13,9 +13,11 @@ import {
   type TeamCardPayload,
 } from "../api/client";
 import { PROTOCOL_STAGE_LABELS, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../card-payment/protocolBind";
+import { planLabel } from "../plans";
 
 interface Props {
   orderId: string;
+  plan?: string;
   country: string;
   sessionEmail?: string | null;
   initialBilling?: Partial<BillingInput> | null;
@@ -30,7 +32,7 @@ interface Props {
 }
 
 export function PlusProtocolPayPanel({
-  orderId, country, sessionEmail, initialBilling, amount, currency, quotationError, disabled = false,
+  orderId, plan = "plus", country, sessionEmail, initialBilling, amount, currency, quotationError, disabled = false,
   submissionDisabled = false, onBusyChange, onDone, onRefreshQuote,
 }: Props) {
   const [card, setCard] = useState<TeamCardPayload>({ number: "", cvc: "", exp_month: "", exp_year: "" });
@@ -168,7 +170,7 @@ export function PlusProtocolPayPanel({
   };
 
   return (
-    <Stack gap="md" maw={720} mx="auto" data-testid="plus-protocol-pay-panel"
+    <Stack gap="md" maw={720} mx="auto" data-testid={`${plan}-protocol-pay-panel`}
       onKeyDownCapture={(event) => {
         if (event.key === "Enter" && event.target instanceof HTMLInputElement) {
           event.preventDefault();
@@ -178,7 +180,7 @@ export function PlusProtocolPayPanel({
       <Paper withBorder p="lg" radius="md">
         <Group justify="space-between">
           <div>
-            <Text size="sm" fw={600}>Plus 协议支付</Text>
+            <Text size="sm" fw={600}>{planLabel(plan)} 协议支付</Text>
             <Text size="xs" c="dimmed">应付金额</Text>
             <Text fz={30} fw={700}>{price || "待取得报价"}</Text>
           </div>

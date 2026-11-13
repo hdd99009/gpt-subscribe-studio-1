@@ -14,7 +14,7 @@ export function SessionField({ value, onChange, team, disabled }: Props) {
       description={
         team
           ? "Team 长链一般只需要 accessToken，有整段 JSON 也可以贴。"
-          : "请粘贴整段 session JSON（accessToken、sessionToken、cookies / oai-did）。Plus / Pro 页内填卡只贴 accessToken 经常不够。"
+          : "请粘贴整段 session JSON（accessToken、sessionToken、cookies / oai-did）。Plus / Go / Pro 页内填卡只贴 accessToken 经常不够。"
       }
       placeholder='{"accessToken": "…"}'
       autosize

@@ -2,7 +2,7 @@ import { Badge, Divider, Group, Paper, Stack, Text, Title } from "@mantine/core"
 
 import { formatAmount, isHostedOrder, type Order, type Plan } from "../api/client";
 import { FAILED_STATUSES, SUCCESS_STATUSES } from "../api/history";
-import { planLabel, regionLabel } from "../plans";
+import { isPlusOrGo, planLabel, regionLabel } from "../plans";
 
 export const STATUS_LABELS: Record<string, string> = {
   created: "已创建",
@@ -60,7 +60,7 @@ export function OrderSummary({ plan, country, order, seats }: Props) {
           ) : (
             <Text size="sm" c="dimmed" ta="right">
               {!order
-                ? plan === "plus" ? "填写账单地址并创建结账后显示" : "创建结账后显示"
+                ? isPlusOrGo(plan) ? "填写账单地址并创建结账后显示" : "创建结账后显示"
                 : isHostedOrder(order)
                   ? "尚未取得 Stripe 报价"
                   : "未从结账拿到金额"}

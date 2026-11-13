@@ -49,6 +49,10 @@ export function isProFamily(value: Plan): boolean {
   return value === "pro_lite" || value === "pro" || value === "pro_max";
 }
 
+export function isPlusOrGo(value: string | undefined): boolean {
+  return value === "plus" || value === "go";
+}
+
 export function familyOf(value: Plan): Family {
   if (value === "go") return "go";
   if (value === "team") return "team";

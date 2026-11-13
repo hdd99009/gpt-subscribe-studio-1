@@ -7,11 +7,14 @@ import {
   bindAndPayProtocol,
   cancelOrderRenewal,
   checkSession,
+  clearMemoryOrders,
   createOrder,
   getBindAndPayProtocol,
+  listMemoryOrders,
   type BindAndPayProtocolInput,
   type BindAndPayProtocolResult,
   type Order,
+  type Plan,
 } from "../src/api/client";
 import { PROTOCOL_STAGE_LABELS, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../src/card-payment/protocolBind";
 import { ProtocolPayPanel } from "../src/components/ProtocolPayPanel";
@@ -20,6 +23,10 @@ import { HistoryTable } from "../src/components/HistoryTable";
 import { loadHistory, recordOrder } from "../src/api/history";
 import { elementPaymentMethod } from "../src/card-payment/stripePaymentMethod";
 import { OrderNew } from "../src/pages/OrderNew";
+import { isPlusOrGo } from "../src/plans";
+import { App } from "../src/App";
+import { MemoryOrders } from "../src/components/MemoryOrders";
+import { subscribeOrderUpdates } from "../src/api/events";
 
 const order: Order = {
   id: "fixture", plan: "plus", billing_country: "DE", status: "awaiting_payment",
@@ -31,9 +38,9 @@ const input: BindAndPayProtocolInput = {
   expected_amount: "20", expected_currency: "usd",
 };
 
-function renderPanel() {
+function renderPanel(plan: Plan = "plus") {
   return renderToStaticMarkup(<MantineProvider><form><ProtocolPayPanel orderId={order.id}
-    bindBeforePay country="DE" sessionEmail="fixture@example.invalid" amount="20" currency="usd"
+    plan={plan} bindBeforePay country="DE" sessionEmail="fixture@example.invalid" amount="20" currency="usd"
     publishableKey="pk_test_fixture" checkoutUrl={order.checkout_url} pmMode="stripe" /></form></MantineProvider>);
 }
 
@@ -62,6 +69,76 @@ test("Plus bindBeforePay renders server card inputs and never renders Stripe or 
   assert.equal((html.match(/<form\b/g) || []).length, 1);
   assert.equal((html.match(/<button\b/g) || []).length, (html.match(/<button\b[^>]*type="button"/g) || []).length);
   assert.ok(!html.includes('type="submit"'));
+});
+
+test("Go uses the shared checkout protocol and renders its own plan label", () => {
+  assert.equal(isPlusOrGo("plus"), true);
+  assert.equal(isPlusOrGo("go"), true);
+  assert.equal(isPlusOrGo("team"), false);
+  assert.equal(isPlusOrGo("pro"), false);
+  assert.equal(isPlusOrGo(undefined), false);
+  const html = renderPanel("go");
+  assert.ok(html.includes('data-testid="go-protocol-pay-panel"'));
+  assert.ok(html.includes("Go 协议支付"));
+  assert.ok(html.includes("Stripe 支付直连"));
+  assert.ok(html.includes("confirmation_tokens"));
+  assert.ok(html.includes("查询协议状态"));
+});
+
+test("memory orders have a dedicated tab and explicit refresh and clear controls", () => {
+  const app = renderToStaticMarkup(<MantineProvider><App /></MantineProvider>);
+  assert.ok(app.includes("-tab-memory"));
+  assert.ok(app.includes("内存订单"));
+  const panel = renderToStaticMarkup(<MantineProvider><MemoryOrders active={false} onCleared={() => {}} /></MantineProvider>);
+  assert.ok(panel.includes("当前后台进程保存的订单"));
+  assert.ok(panel.includes("刷新"));
+  assert.ok(panel.includes("清除全部"));
+});
+
+test("memory order APIs list locally and clear only the explicit order snapshot", async () => {
+  const previous = globalThis.fetch;
+  const requests: { url: string; method: string; body?: unknown }[] = [];
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), method: init?.method || "GET",
+      body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    return new Response(JSON.stringify(init?.method === "DELETE"
+      ? { deleted_ids: ["fixture"], missing_ids: [], skipped: [] } : []), { status: 200 });
+  };
+  try {
+    assert.deepEqual(await listMemoryOrders(), []);
+    const cleared = await clearMemoryOrders(["fixture"]);
+    assert.deepEqual(cleared.deleted_ids, ["fixture"]);
+    assert.deepEqual(requests, [
+      { url: "/api/memory-orders", method: "GET", body: undefined },
+      { url: "/api/memory-orders", method: "DELETE", body: { order_ids: ["fixture"] } },
+    ]);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("memory order request failures expose the backend message", async () => {
+  const previous = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ detail: "读取内存订单失败" }), { status: 503 });
+  try {
+    await assert.rejects(listMemoryOrders, /读取内存订单失败/);
+    await assert.rejects(() => clearMemoryOrders(["fixture"]), /读取内存订单失败/);
+  } finally { globalThis.fetch = previous; }
+});
+
+test("a deleted order closes its event source and notifies the current order view", () => {
+  const previous = globalThis.EventSource;
+  const listeners: Record<string, (event: { data: string }) => void> = {};
+  let closed = false;
+  globalThis.EventSource = class {
+    addEventListener(name: string, callback: (event: { data: string }) => void) { listeners[name] = callback; }
+    close() { closed = true; }
+  } as unknown as typeof EventSource;
+  try {
+    let type: string | undefined;
+    subscribeOrderUpdates("fixture", (event) => { type = event.type; });
+    listeners.message({ data: JSON.stringify({ type: "deleted", order_id: "fixture", status: "deleted", timestamp: 0 }) });
+    assert.equal(closed, true);
+    assert.equal(type, "deleted");
+  } finally { globalThis.EventSource = previous; }
 });
 
 test("Plus starts with empty card and real-address fields while prefiling only account email and country", () => {

@@ -74,10 +74,11 @@ def _run(secrets, context, spec, *, card=None, billing=None, read_only=False):
                     view.renewal = {"status": "pending", "message": "付款已确认，正在核验订阅并关闭自动续费"}
                     store.update_status(order.id, OrderStatus.VERIFYING)
                     logger.info("protocol_payment_confirmed id=%s", order.id)
-                context["renewal"] = _cancel_renewal(secrets, "plus", client=client)
+                plan = str(spec.get("plan") or "plus")
+                context["renewal"] = _cancel_renewal(secrets, plan, client=client)
                 if context["renewal"]["status"] == "cancelled":
                     result = {**result, "state": "paid", "stage": "payment", "intent_status": "succeeded",
-                              "message": "付款已确认，Plus 订阅已生效，自动续费已关闭"}
+                              "message": f"付款已确认，{plan.title()} 订阅已生效，自动续费已关闭"}
                     result.pop("code", None)
             return result
         finally:
@@ -89,8 +90,8 @@ def _run(secrets, context, spec, *, card=None, billing=None, read_only=False):
 
 def _cached(order_id: str) -> dict | None:
     order = store.get_order(order_id)
-    if order is None or order.plan is not Plan.PLUS:
-        raise HTTPException(404, "Plus 订单不存在")
+    if order is None or order.plan not in {Plan.PLUS, Plan.GO}:
+        raise HTTPException(404, "Plus / Go 订单不存在")
     view = store.view(order_id)
     if order.status in {OrderStatus.ACTIVE, OrderStatus.DELIVERED, OrderStatus.FAILED}:
         result = dict(view.protocol_saved_result or {})
@@ -105,8 +106,8 @@ def _cached(order_id: str) -> dict | None:
 
 def _context(order_id: str, *, start: bool):
     order = store.get_order(order_id)
-    if order is None or order.plan is not Plan.PLUS:
-        raise HTTPException(404, "Plus 订单不存在")
+    if order is None or order.plan not in {Plan.PLUS, Plan.GO}:
+        raise HTTPException(404, "Plus / Go 订单不存在")
     secrets = vault.get(order_id)
     if secrets is None:
         raise _error(401, ErrorCode.SESSION_EXPIRED, "订单凭证已过期，请重新创建订单")
@@ -125,6 +126,7 @@ def _spec(order, view, secrets, payload=None, *, retry_route=False):
     return {
         "retry_route": retry_route,
         "order_id": order.id,
+        "plan": str(order.plan),
         "account_id": secrets.account_id, "country": order.billing_country,
         "promo": order.mode.billing_mode is BillingMode.PROMO,
         "promo_code": view.promo_code or "", "promo_campaign_id": view.promo_campaign_id or "",
@@ -211,7 +213,7 @@ async def _run_and_apply(order, secrets, view, context, spec, **kwargs) -> dict:
         result = await asyncio.to_thread(_run, secrets, context, spec, **kwargs)
         return await _apply(order, secrets, view, context, result)
 
-    task = asyncio.create_task(process())
+    task = asyncio.create_task(process(), name=f"order:{order.id}")
     previous = context.get("operation_task")
     if previous is None or previous.done():
         context["operation_task"] = task

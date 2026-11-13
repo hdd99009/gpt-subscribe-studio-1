@@ -192,13 +192,13 @@ def _app_confirm(client: ChatGPTClient, context: dict) -> dict | None:
     return None
 
 
-def _active_plus(payload: dict) -> bool:
+def _active_subscription(payload: dict, expected_plan: str) -> bool:
     entitlement = payload.get("entitlement") if isinstance(payload.get("entitlement"), dict) else {}
     plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
     active = payload.get("is_active") is True or entitlement.get("has_active_subscription") is True
     if payload.get("is_active") is False or entitlement.get("has_active_subscription") is False:
         active = False
-    return plan in {"plus", "chatgptplusplan"} and active and payload.get("is_delinquent") is not True and entitlement.get("is_delinquent") is not True
+    return plan in {expected_plan, f"chatgpt{expected_plan}plan"} and active and payload.get("is_delinquent") is not True and entitlement.get("is_delinquent") is not True
 
 
 def _paid_checkout(client: ChatGPTClient, context: dict, *, read_only: bool) -> dict | None:
@@ -227,11 +227,12 @@ def _paid_checkout(client: ChatGPTClient, context: dict, *, read_only: bool) -> 
         except Exception:
             context["ack_complete"] = False
     subscription = client.subscription_payload()
-    if _active_plus(subscription):
+    plan = str(context.get("plan") or "plus")
+    if _active_subscription(subscription, plan):
         # An active subscription plus the exact paid checkout reconciles a lost acknowledgment response.
-        return outcome("paid", "payment", "原结账已完成，Plus 订阅已生效", intent_status="succeeded")
+        return outcome("paid", "payment", f"原结账已完成，{plan.title()} 订阅已生效", intent_status="succeeded")
     return outcome("pending" if context.get("ack_complete") else "unknown", "payment",
-                   "付款已确认，等待 Plus 订阅生效" if context.get("ack_complete") else "付款已确认，订阅登记结果待核实；本次未重复登记或扣款",
+                   f"付款已确认，等待 {plan.title()} 订阅生效" if context.get("ack_complete") else "付款已确认，订阅登记结果待核实；本次未重复登记或扣款",
                    intent_status="succeeded")
 
 
@@ -307,6 +308,7 @@ def run_checkout_protocol(client: ChatGPTClient, context: dict, spec: dict, *, c
     try:
         restore_account(client, str(context.get("account_id") or spec.get("account_id") or ""))
         context["account_id"] = client.account_id
+        context["plan"] = str(spec.get("plan") or context.get("plan") or "plus")
         if not context.get("checkout_id"):
             context.update(checkout_id=spec["checkout_id"], checkout_url=spec["checkout_url"],
                 publishable_key=spec["publishable_key"], currency=str(spec["currency"]).upper(),

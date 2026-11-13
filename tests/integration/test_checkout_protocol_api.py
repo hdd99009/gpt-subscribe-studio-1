@@ -32,8 +32,9 @@ def _legacy_engine(monkeypatch):
     monkeypatch.setenv("GSS_PLUS_ENGINE", "legacy")
 
 
-@pytest.fixture
-def flow(monkeypatch):
+@pytest.fixture(params=["plus", "go"])
+def flow(monkeypatch, request):
+    plan = request.param
     state = {"calls": [], "violations": [], "account": "account_fixture", "minor": 1363,
              "page_status": "open", "payment_status": "unpaid", "pi_status": "requires_confirmation",
              "after_confirm": "succeeded", "active": True, "will_renew": True, "closed": 0, "created": 0}
@@ -97,9 +98,9 @@ def flow(monkeypatch):
                 return response(intent())
             if self.service == "app" and url == APP_BASE + "/backend-api/subscriptions":
                 record("subscription_get")
-                return response({"plan_type": state.get("subscription_plan", "plus"), "is_active": state["active"],
+                return response({"plan_type": state.get("subscription_plan", plan), "is_active": state["active"],
                     "will_renew": state["will_renew"],
-                    "entitlement": {"has_active_subscription": state["active"], "subscription_plan": "chatgptplusplan"}})
+                    "entitlement": {"has_active_subscription": state["active"], "subscription_plan": f"chatgpt{plan}plan"}})
             state["violations"].append("unexpected GET " + url)
             raise AssertionError(url)
         def post(self, url, **kwargs):
@@ -199,7 +200,7 @@ def flow(monkeypatch):
     monkeypatch.setenv("GSS_USE_FAKE", "1")
     store.clear()
     with TestClient(create_app()) as api:
-        created = api.post("/api/orders", json={"plan": "plus", "billing_country": "JP", "session": "fixture-session"})
+        created = api.post("/api/orders", json={"plan": plan, "billing_country": "JP", "session": "fixture-session"})
         assert created.status_code == 201, created.text
         oid = created.json()["id"]
         view = store.view(oid)
@@ -215,7 +216,7 @@ def flow(monkeypatch):
         secret.checkout_session_id = checkout_id
         secret.publishable_key = "pk_test_direct"
         monkeypatch.setenv("GSS_USE_FAKE", "0")
-        yield SimpleNamespace(api=api, root=f"/api/orders/{oid}/bind-and-pay-protocol", oid=oid, body=body, state=state)
+        yield SimpleNamespace(api=api, root=f"/api/orders/{oid}/bind-and-pay-protocol", oid=oid, body=body, state=state, plan=plan)
         vault.drop(oid)
         store.clear()
     assert not state["violations"], state["violations"]
@@ -330,6 +331,8 @@ def test_direct_checkout_uses_one_token_and_original_context_then_delivers(flow)
     result = post(flow)
     assert result["state"] == "paid"
     assert result["order"]["status"] == "delivered"
+    assert result["order"]["plan"] == flow.plan
+    assert flow.plan.title() in result["message"]
     assert result["order"]["billing_country"] == "JP"
     assert result["order"]["currency"] == "JPY"
     assert result["order"]["amount"] == "1363"
@@ -617,6 +620,18 @@ def test_paid_context_without_active_subscription_stays_pending(flow):
     assert names(flow).count("ack") == names(flow).count("pi_confirm") == 1
 
 
+def test_paid_checkout_with_another_plan_does_not_deliver_or_cancel_renewal(flow):
+    flow.state["subscription_plan"] = "go" if flow.plan == "plus" else "plus"
+    result = post(flow)
+    assert result["state"] == "pending"
+    assert result["order"]["status"] != "delivered"
+    assert flow.state["will_renew"] is True
+    assert "renewal_cancel" not in names(flow)
+    flow.state["subscription_plan"] = flow.plan
+    assert get(flow)["state"] == "paid"
+    assert names(flow).count("pi_confirm") == names(flow).count("renewal_cancel") == 1
+
+
 def test_get_does_not_acknowledge_delayed_paid_context(flow):
     flow.state["page_delayed"] = True
     assert post(flow)["state"] == "pending"
@@ -656,7 +671,8 @@ def test_legacy_routes_block_current_pending_flow(flow,suffix,method):
     body = {"payment_method_token":"pm_fixture"} if suffix == "/pay" else {"payment_method_id":"pm_fixture","billing":flow.body["billing"]} if suffix == "/pay-protocol" else None
     before = list(flow.state["calls"])
     response = getattr(flow.api,method)(f"/api/orders/{flow.oid}"+suffix,**({"json":body} if body else {}))
-    assert response.status_code == 409, response.text
+    expected_status = 404 if flow.plan == "go" and suffix.startswith("/saved-card") else 409
+    assert response.status_code == expected_status, response.text
     assert flow.state["calls"] == before
 
 

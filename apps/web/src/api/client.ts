@@ -53,6 +53,31 @@ export interface SessionInspection {
   session: string;
 }
 
+export interface MemoryOrder extends Pick<Order, "id" | "status" | "plan" | "billing_country" | "amount" | "currency" | "session_email" | "card_last4" | "payment_confirmed" | "renewal" | "last_error"> {
+  created_at: string;
+  deletion_blocked_reason?: string | null;
+}
+
+export interface MemoryOrdersClearResult {
+  deleted_ids: string[];
+  missing_ids: string[];
+  skipped: { id: string; reason: string }[];
+}
+
+export async function listMemoryOrders(): Promise<MemoryOrder[]> {
+  const res = await fetch("/api/memory-orders");
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
+}
+
+export async function clearMemoryOrders(orderIds: string[]): Promise<MemoryOrdersClearResult> {
+  const res = await fetch("/api/memory-orders", {
+    method: "DELETE", headers: jsonHeaders, body: JSON.stringify({ order_ids: orderIds }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
+}
+
 export async function checkSession(session: string): Promise<SessionInspection> {
   const res = await fetchWithDeadline("/api/sessions/check", {
     method: "POST", headers: jsonHeaders, body: JSON.stringify({ session }),

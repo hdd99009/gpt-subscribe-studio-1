@@ -48,9 +48,11 @@ def client(monkeypatch, tax_response):
     return value
 
 
-def test_checkout_quotes_submitted_address_and_returns_only_upstream_total(monkeypatch):
+@pytest.mark.parametrize("plan", ["plus", "go"])
+def test_checkout_quotes_submitted_address_and_returns_only_upstream_total(monkeypatch, plan):
     value = client(monkeypatch, Response({"amount_total": 123456, "currency": "PHP"}))
-    created = value.create_checkout(plan="plus", country="PH", billing=BILLING)
+    created = value.create_checkout(plan=plan, country="PH", billing=BILLING)
+    assert value._http.posts[0][1]["json"]["plan_name"] == f"chatgpt{plan}plan"
     assert created.amount == Decimal("1234.56") and created.currency == "PHP"
     assert created.billing == BILLING
     assert len(value._http.posts) == 2
@@ -90,8 +92,9 @@ def test_manual_quote_connection_failure_is_not_silently_ignored(monkeypatch):
 
 
 @pytest.mark.parametrize("amount", [Decimal("1234.56"), None])
-def test_adapter_preserves_manual_billing_and_never_falls_back_to_list_price(monkeypatch, amount):
-    request = CheckoutRequest(session="fixture", plan=Plan.PLUS, billing_country="PH",
+@pytest.mark.parametrize("plan", [Plan.PLUS, Plan.GO])
+def test_adapter_preserves_manual_billing_and_never_falls_back_to_list_price(monkeypatch, amount, plan):
+    request = CheckoutRequest(session="fixture", plan=plan, billing_country="PH",
                               billing_mode=BillingMode.STANDARD, billing=dict(BILLING))
     adapter = UpstreamCheckoutAdapter()
     monkeypatch.setattr("gss_checkout.adapter.align_proxy_region", lambda proxy, country: None)

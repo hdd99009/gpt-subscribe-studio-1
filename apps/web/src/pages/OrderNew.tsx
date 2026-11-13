@@ -32,13 +32,14 @@ import { CheckoutLinkCard } from "../components/CheckoutLinkCard";
 import { emptyTeamCard, type TeamCardDraft } from "../card-payment/TeamCardForm";
 import { BillingForm } from "../components/BillingForm";
 import { protocolBillingError } from "../card-payment/protocolBind";
-import { planLabel } from "../plans";
+import { isPlusOrGo, planLabel } from "../plans";
 
 interface Props {
   onRecord: (order: Order) => void;
+  clearedOrderIds?: string[];
 }
 
-export function OrderNew({ onRecord }: Props) {
+export function OrderNew({ onRecord, clearedOrderIds }: Props) {
   const [plan, setPlan] = useState<Plan>("plus");
   const [country, setCountry] = useState("");
   const [session, setSession] = useState("");
@@ -90,6 +91,7 @@ export function OrderNew({ onRecord }: Props) {
 
   function reset() {
     if (busy || checkingSession || protocolBusy) return;
+    currentOrderId.current = null;
     setOrder(null);
     setResult(null);
     setCard(null);
@@ -110,6 +112,10 @@ export function OrderNew({ onRecord }: Props) {
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
   }
 
+  useEffect(() => {
+    if (order && clearedOrderIds?.includes(order.id)) reset();
+  }, [clearedOrderIds, order?.id, busy, checkingSession, protocolBusy]);
+
   // 用 SSE 实时订阅订单状态，替代轮询
   useEffect(() => {
     if (!result || isSettled(result.status)) return;
@@ -119,10 +125,18 @@ export function OrderNew({ onRecord }: Props) {
     
     const unsubscribe = subscribeOrderUpdates(id, async (event: OrderUpdateEvent) => {
       console.log(`[订单 ${id}] SSE 更新:`, event);
+      if (event.type === "deleted") {
+        currentOrderId.current = null;
+        setOrder(null);
+        setResult(null);
+        setError("该后台内存订单已清除，请重新创建结账。");
+        return;
+      }
       
       // 收到状态更新后，重新获取完整订单数据
       try {
         const next = await getOrder(id);
+        if (currentOrderId.current !== id) return;
         setResult(next);
         if (isSettled(next.status)) {
           onRecord(next);
@@ -144,7 +158,7 @@ export function OrderNew({ onRecord }: Props) {
   const handledSecret = useRef("");
   useEffect(() => {
     const secret = result?.next_action?.client_secret;
-    if (!result || (result.plan === "plus" && pmMode === "server") || result.status !== "requires_action" || !secret || !result.publishable_key) return;
+    if (!result || (isPlusOrGo(result.plan) && pmMode === "server") || result.status !== "requires_action" || !secret || !result.publishable_key) return;
     if (handledSecret.current === secret) return;
     handledSecret.current = secret;
     const id = result.id;
@@ -179,7 +193,7 @@ export function OrderNew({ onRecord }: Props) {
   }, [result, onRecord, pmMode]);
 
   // 支付已提交但订阅还没确认（verifying）：自动重查，避免页面一直转圈。
-  const verifyingId = result && result.plan !== "team" && (result.plan !== "plus" || pmMode === "stripe") && result.status === "verifying" ? result.id : "";
+  const verifyingId = result && result.plan !== "team" && (!isPlusOrGo(result.plan) || pmMode === "stripe") && result.status === "verifying" ? result.id : "";
   useEffect(() => {
     if (!verifyingId) return;
     let stopped = false;
@@ -263,7 +277,7 @@ export function OrderNew({ onRecord }: Props) {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (busy || checkingSession || protocolBusy || order?.plan === "plus") return;
+    if (busy || checkingSession || protocolBusy || (order && isPlusOrGo(order.plan))) return;
     setError(null);
     setBusy(true);
     try {
@@ -283,7 +297,7 @@ export function OrderNew({ onRecord }: Props) {
         const manualBilling = Object.fromEntries(Object.entries(checkoutBilling).map(([key, value]) =>
           [key, (value || "").trim()])) as unknown as BillingInput;
         manualBilling.country = manualBilling.country.toUpperCase();
-        if (plan === "plus") {
+        if (isPlusOrGo(plan)) {
           const invalid = protocolBillingError(manualBilling);
           if (invalid || !manualBilling.postal_code) {
             setError(invalid || "请填写账单地址邮编。");
@@ -299,9 +313,9 @@ export function OrderNew({ onRecord }: Props) {
           workspace_name: plan === "team" ? team.workspace.trim() : "",
           seat_quantity: plan === "team" ? team.seats : undefined,
           price_interval: plan === "team" ? team.interval : undefined,
-          billing: plan === "plus" ? manualBilling : undefined,
+          billing: isPlusOrGo(plan) ? manualBilling : undefined,
         });
-        if (created.plan !== "plus" && !created.publishable_key && !isHostedOrder(created)) {
+        if (!isPlusOrGo(created.plan) && !created.publishable_key && !isHostedOrder(created)) {
           throw new Error("结账已创建，但没有拿到 Stripe 公钥，无法加载安全输入框。");
         }
         setOrder(created);
@@ -429,11 +443,11 @@ export function OrderNew({ onRecord }: Props) {
         <Paper className="order-main" withBorder p="lg" radius="md">
           <Stepper active={result && SUCCESS_STATUSES.includes(result.status) ? 3 : step} size="sm" mb="lg" allowNextStepsSelect={false}>
             <Stepper.Step label="配置订单" description="session、套餐、地区" />
-            <Stepper.Step label={order?.plan === "plus" ? pmMode === "server" ? "协议支付" : "Stripe 输入框支付" : linkOnly ? "长链支付" : "填卡支付"} description={linkOnly ? "打开链接付款" : "地址与卡片"} />
+            <Stepper.Step label={isPlusOrGo(order?.plan) ? pmMode === "server" ? "协议支付" : "Stripe 输入框支付" : linkOnly ? "长链支付" : "填卡支付"} description={linkOnly ? "打开链接付款" : "地址与卡片"} />
             <Stepper.Step label="结果" description="成功或失败" />
           </Stepper>
 
-          {order?.plan !== "plus" && order?.checkout_url && step >= 1 && (
+          {!isPlusOrGo(order?.plan) && order?.checkout_url && step >= 1 && (
             <CheckoutLinkCard url={order.checkout_url} />
           )}
 
@@ -483,7 +497,7 @@ export function OrderNew({ onRecord }: Props) {
                 onTeam={setTeam}
                 disabled={busy}
               />
-              {plan === "plus" && (
+              {isPlusOrGo(plan) && (
                 <Paper withBorder p="md" radius="md" data-testid="checkout-billing-form">
                   <Stack gap="sm">
                     <Text fw={600}>账单地址（创建结账前填写）</Text>
@@ -507,8 +521,8 @@ export function OrderNew({ onRecord }: Props) {
                   ]}
                 />
                 <Text size="xs" c="dimmed" mt={6}>
-                  {plan === "plus"
-                    ? "Plus 协议模式按 2026-10-29 HAR 逐请求复刻：随机设备指纹 + Stripe 遥测，核算税费后创建 confirmation_tokens，完成 ChatGPT confirm 与 PaymentIntent confirm；输入框模式保留浏览器 Stripe 安全输入与付款。"
+                  {isPlusOrGo(plan)
+                    ? `${planLabel(plan)} 协议模式按 2026-10-29 HAR 逐请求复刻：随机设备指纹 + Stripe 遥测，核算税费后创建 confirmation_tokens，完成 ChatGPT confirm 与 PaymentIntent confirm；输入框模式保留浏览器 Stripe 安全输入与付款。`
                     : "协议提交由服务端向 Stripe 换 pm_；Stripe 输入框让卡号只进 Stripe iframe。"}
                 </Text>
               </div>
@@ -568,7 +582,7 @@ export function OrderNew({ onRecord }: Props) {
                 </Paper>
               )}
               <Text size="xs" c="dimmed">
-                {plan === "plus"
+                {isPlusOrGo(plan)
                   ? pmMode === "server" ? "协议模式：沿用当前订单 checkout，每次随机生成一套设备（UA/UA-CH/屏幕/时区/guid-muid-sid），先发 m.stripe.com/6 指纹与 r.stripe.com/b 事件流，再核算税费、创建 confirmation_tokens、完成 ChatGPT confirm 与 PaymentIntent confirm，最后 GET checkout 核对 complete / paid 并查询订阅。" : "输入框模式：卡号只进入 Stripe 安全输入框，浏览器取得支付方式后由服务端确认付款。"
                   : "结账地区由上面选的地区决定。session 只在内存中使用，不写数据库。"}
               </Text>
@@ -604,7 +618,7 @@ export function OrderNew({ onRecord }: Props) {
 
 
 
-          {step === 2 && result && <ResultPanel order={result} protocolOnly={result.plan === "plus" && pmMode === "server"} onReset={reset}
+          {step === 2 && result && <ResultPanel order={result} protocolOnly={isPlusOrGo(result.plan) && pmMode === "server"} onReset={reset}
             onOrderChange={(latest) => {
               if (latest.id !== currentOrderId.current) return;
               setResult(latest);
@@ -619,10 +633,11 @@ export function OrderNew({ onRecord }: Props) {
           <div className="order-payment">
             <Stack gap="md">
               <ProtocolPayPanel
-                key={order.plan === "plus" ? order.id : `${order.id}:${order.checkout_url || ""}`}
+                key={isPlusOrGo(order.plan) ? order.id : `${order.id}:${order.checkout_url || ""}`}
                 orderId={order.id}
-                bindBeforePay={order.plan === "plus" && pmMode === "server"}
-                browserPayment={order.plan === "plus" && pmMode === "stripe"}
+                plan={order.plan}
+                bindBeforePay={isPlusOrGo(order.plan) && pmMode === "server"}
+                browserPayment={isPlusOrGo(order.plan) && pmMode === "stripe"}
                 submissionDisabled={order.status !== "awaiting_payment"}
                 sessionEmail={order.session_email}
                 initialBilling={order.billing}
@@ -636,14 +651,14 @@ export function OrderNew({ onRecord }: Props) {
                 exitLabel={protocolExit}
                 publishableKey={order.publishable_key}
                 checkoutUrl={order.checkout_url}
-                disabled={busy || (order.plan !== "plus" && order.status !== "awaiting_payment")}
+                disabled={busy || (!isPlusOrGo(order.plan) && order.status !== "awaiting_payment")}
                 onBusyChange={setProtocolBusy}
                 onRefreshQuote={async () => {
                   if (!order) return;
                   setBusy(true);
                   setError(null);
                   try {
-                    if (order.plan === "plus") {
+                    if (isPlusOrGo(order.plan)) {
                       setOrder(await refreshCheckoutQuote(order.id));
                       return;
                     }
@@ -665,8 +680,8 @@ export function OrderNew({ onRecord }: Props) {
                     if (!latest || latest.id !== currentOrderId.current) return;
                     setOrder((current) => current?.id === latest.id ? latest : current);
                     if (latest.payment_confirmed || latest.subscription?.active || SUCCESS_STATUSES.includes(latest.status)
-                      || ((latest.plan !== "plus" || pmMode === "stripe") && isSettled(latest.status))
-                       || (latest.plan === "plus" && pmMode === "stripe" && latest.status !== "awaiting_payment")) finish(latest);
+                      || ((!isPlusOrGo(latest.plan) || pmMode === "stripe") && isSettled(latest.status))
+                       || (isPlusOrGo(latest.plan) && pmMode === "stripe" && latest.status !== "awaiting_payment")) finish(latest);
                   })();
                 }}
               />

@@ -823,7 +823,7 @@ class PlusHarProtocol:
         entitlement = payload.get("entitlement") if isinstance(payload.get("entitlement"), dict) else {}
         plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
         active = payload.get("is_active") is True or entitlement.get("has_active_subscription") is True
-        return plan in {"plus", "chatgptplusplan"} and active
+        return plan in {self.plan, f"chatgpt{self.plan}plan"} and active
 
     def _ack_checkout(self) -> bool:
         body = {"stripe_checkout_session_id": self.checkout_id,
@@ -891,11 +891,11 @@ class PlusHarProtocol:
             if self._subscription_active():
                 out.state = "paid"
                 out.intent_status = intent_status or "succeeded"
-                out.message = "Plus 订阅已生效"
+                out.message = f"{self.plan.title()} 订阅已生效"
             else:
                 out.state = "pending"
                 out.intent_status = intent_status or "succeeded"
-                out.message = "付款已确认，等待 Plus 订阅生效"
+                out.message = f"付款已确认，等待 {self.plan.title()} 订阅生效"
             return out
         if intent_status == "succeeded":
             out.state = "pending"
@@ -1156,6 +1156,7 @@ def run_har_context(
         customer_session_client_secret=str(spec.get("customer_session_client_secret") or ""),
         email=str((billing or {}).get("email") or ""),
         country=country,
+        plan=str(spec.get("plan") or "plus"),
         account_id=str(client.account_id or spec.get("account_id") or ""),
         processor=str(spec.get("processor") or ""),
         confirm_return_url=str(spec.get("confirm_return_url") or ""),

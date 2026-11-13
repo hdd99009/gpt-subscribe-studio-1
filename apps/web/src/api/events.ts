@@ -3,6 +3,7 @@
  */
 
 export interface OrderUpdateEvent {
+  type?: "deleted";
   order_id: string;
   status: string;
   timestamp: number;
@@ -34,6 +35,7 @@ export function subscribeOrderUpdates(
         console.log(`[SSE] Subscribed to order ${orderId}, initial status: ${data.status}`);
         return;
       }
+      if (data.type === "deleted" || data.error) eventSource.close();
 
       // 触发回调
       onUpdate(data as OrderUpdateEvent);
