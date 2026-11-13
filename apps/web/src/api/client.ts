@@ -461,6 +461,37 @@ export interface ProxyInfo {
   routing_format?: "123proxy" | "standard";
 }
 
+export interface DebugCapture {
+  id: string;
+  started_at: string;
+  count: number;
+  pending: number;
+  errors: number;
+  size_bytes: number;
+}
+
+export interface DebugSettings {
+  enabled: boolean;
+  capture_id: string;
+  directory: string;
+  captures: DebugCapture[];
+  last_error: string;
+}
+
+export async function getDebugSettings(): Promise<DebugSettings> {
+  const res = await fetch("/api/settings/debug");
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
+}
+
+export async function setDebugEnabled(enabled: boolean): Promise<DebugSettings> {
+  const res = await fetch("/api/settings/debug", {
+    method: "PUT", headers: jsonHeaders, body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return await res.json();
+}
+
 export async function getProxies(): Promise<{ checkout: ProxyInfo; approve: ProxyInfo }> {
   const res = await fetch("/api/settings/proxies");
   if (!res.ok) throw new Error(await readError(res));

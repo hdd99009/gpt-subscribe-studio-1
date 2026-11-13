@@ -1,5 +1,5 @@
 import { ActionIcon, Badge, Container, Group, Tabs, Text, Title, Tooltip, useMantineColorScheme } from "@mantine/core";
-import { IconHistory, IconLogout, IconMoon, IconNetwork, IconReceipt, IconSun } from "@tabler/icons-react";
+import { IconBug, IconHistory, IconLogout, IconMoon, IconNetwork, IconReceipt, IconSun } from "@tabler/icons-react";
 import { useCallback, useState } from "react";
 
 import { loadHistory, recordOrder } from "./api/history";
@@ -7,6 +7,7 @@ import type { Order } from "./api/client";
 import { HistoryTable } from "./components/HistoryTable";
 import { ProxySettings } from "./components/ProxySettings";
 import { MemoryOrders } from "./components/MemoryOrders";
+import { DebugSettings } from "./components/DebugSettings";
 import { OrderNew } from "./pages/OrderNew";
 
 export function App() {
@@ -62,6 +63,9 @@ export function App() {
           <Tabs.Tab value="memory" leftSection={<IconReceipt size={16} />}>
             内存订单
           </Tabs.Tab>
+          <Tabs.Tab value="debug" leftSection={<IconBug size={16} />}>
+            调试模式
+          </Tabs.Tab>
         </Tabs.List>
         <Tabs.Panel value="order">
           <OrderNew onRecord={record} clearedOrderIds={clearedOrderIds} />
@@ -74,6 +78,9 @@ export function App() {
         </Tabs.Panel>
         <Tabs.Panel value="memory">
           <MemoryOrders active={tab === "memory"} onCleared={setClearedOrderIds} />
+        </Tabs.Panel>
+        <Tabs.Panel value="debug">
+          <DebugSettings active={tab === "debug"} />
         </Tabs.Panel>
       </Tabs>
 

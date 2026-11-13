@@ -251,6 +251,8 @@ function makeCurlFetch(proxy) {
           status,
           ok: status >= 200 && status < 300,
           headers: { get: () => null },
+          _debugHeaders: result.headers || {},
+          _debugRequestHeaders: result.request_headers || {},
           text: async () => body,
           json: async () => JSON.parse(body),
         });
@@ -436,6 +438,7 @@ async function handleRequest(raw) {
   if (!proxy || /^https?:/i.test(proxy)) {
     fetchImpl = transport.boundedFetch(fetchImpl, timeoutMs, onNetworkFailure);
   }
+  fetchImpl = require("./http_debug.js").captureFetch(fetchImpl, args.debugCapture, proxy);
 
   const assetsDir = __dirname;
   const bootstrapSrc = fs.readFileSync(path.join(assetsDir, "sentinel_bootstrap.js"), "utf8");

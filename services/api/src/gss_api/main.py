@@ -9,9 +9,10 @@ from fastapi.responses import JSONResponse
 
 from gss_core import install_logging_filter
 from gss_core.config import load_settings, missing_upstreams, use_fake_adapters
+from gss_core.http_debug import HttpDebugMiddleware, capture_error_response, install_transport_capture
 from gss_core.proxies import GatewayStore
 
-from .routers import events, orders, promo, proxies, saved_cards, protocol_cards, sessions, memory_orders
+from .routers import debug, events, orders, promo, proxies, saved_cards, protocol_cards, sessions, memory_orders
 
 __version__ = "0.1.0"
 
@@ -32,6 +33,7 @@ def create_app() -> FastAPI:
     _ensure_info_logging()
     install_logging_filter(logging.getLogger("gss"))
     settings = load_settings()
+    install_transport_capture()
 
     app = FastAPI(
         title="gpt-subscribe-studio API",
@@ -47,6 +49,8 @@ def create_app() -> FastAPI:
     app.include_router(events.router)
     app.state.gateway_store = GatewayStore()
     app.include_router(proxies.router)
+    app.include_router(debug.router)
+    app.add_middleware(HttpDebugMiddleware)
 
     @app.get("/api/health", tags=["health"])
     async def health() -> dict:
@@ -85,22 +89,26 @@ def create_app() -> FastAPI:
     @app.exception_handler(Exception)
     async def _conn_error_handler(request, exc):  # noqa: ANN001
         if _ImpersonateError is not None and isinstance(exc, _ImpersonateError):
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=500,
                 content={"code": "http_client_configuration_error",
                          "detail": "本机 HTTP 依赖不支持所需浏览器版本，请更新项目依赖并重启服务。"},
             )
+            capture_error_response(request.scope, response, exc)
+            return response
         is_conn = (
             isinstance(exc, _CurlNetworkErrors)
             or (_HttpxErr is not None and isinstance(exc, _HttpxErr))
             or any(k in str(exc) for k in _CONN_HINTS)
         )
         if is_conn:
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=503,
                 content={"detail": "连接上游服务失败或超时。请检查代理到目标服务的连通性，"
                                    "必要时重试或更换线路。"},
             )
+            capture_error_response(request.scope, response, exc)
+            return response
         raise exc
 
     return app

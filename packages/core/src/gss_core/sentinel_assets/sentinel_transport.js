@@ -62,6 +62,7 @@ function makePythonCurlFetch({ python, helper, proxy, timeoutMs, onFailure = () 
           clearTimeout(timer);
           const status = Number(result.status || 0), body = String(result.body || "");
           resolve({ status, ok: status >= 200 && status < 300, headers: { get: () => null },
+            _debugHeaders: result.headers || {}, _debugRequestHeaders: result.request_headers || {},
             text: async () => body, json: async () => JSON.parse(body) });
         } catch (_) { fail(false); }
       });

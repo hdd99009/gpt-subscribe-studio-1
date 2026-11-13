@@ -289,7 +289,10 @@ class WorkerEngine:
 
 
 def run(poll_interval: float = 5.0, once: bool = False, use_fake: bool = False) -> None:
+    from gss_core.http_debug import install_transport_capture
+
     install_logging_filter()
+    install_transport_capture()
     missing = self_check()
     
     # 如果有缺失的上游，自动使用 Fake adapter

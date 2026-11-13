@@ -15,6 +15,7 @@ from typing import Any, Dict
 from urllib.parse import unquote, urlsplit
 
 from .redaction import redact_sensitive
+from .http_debug import capture_sentinel, sentinel_debug_context
 
 _ASSETS = Path(__file__).with_name("sentinel_assets")
 _BRIDGE = _ASSETS / "sentinel_bridge.js"
@@ -162,6 +163,7 @@ def mint(
 
     if not _BRIDGE.is_file():
         return failed("assets_missing")
+    debug_context = sentinel_debug_context()
     payload = json.dumps(
         {
             "ua": user_agent,
@@ -182,22 +184,27 @@ def mint(
             "cookieHeader": cookie_header,
             "sentinelOrigin": "https://chatgpt.com",
             "requestTimeoutMs": min(30000, max(1000, int((timeout_s - 5) * 1000))),
+            "debugCapture": debug_context,
         },
         separators=(",", ":"),
     ).encode("utf-8")
     env = os.environ.copy()
     env.setdefault("PYTHON_BIN", sys.executable)
     env.setdefault("SENTINEL_PYTHON", sys.executable)
+    capture_sentinel(debug_context, payload)
     try:
         process = _run_bridge(payload, timeout_s, env)
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        capture_sentinel(debug_context, payload, error=exc)
         return failed("node_missing")
     except subprocess.TimeoutExpired as exc:
+        capture_sentinel(debug_context, payload, error=exc)
         stderr = (exc.stderr or b"").decode("utf-8", "replace")
         for reason in ("network_timeout", "network_error"):
             if f"sentinel_transport_failed reason={reason} " in stderr:
                 return failed(reason, "proxy transport failed before overall deadline")
         return failed("node_timeout", f"timeout_seconds={timeout_s}")
+    capture_sentinel(debug_context, payload, process=process)
     output = (process.stdout or b"").decode("utf-8", "replace").strip()
     if not output:
         stderr = (process.stderr or b"").decode("utf-8", "replace").strip().splitlines()

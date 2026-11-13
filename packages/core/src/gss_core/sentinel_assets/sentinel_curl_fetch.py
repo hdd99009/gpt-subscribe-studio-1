@@ -29,6 +29,8 @@ def handle(payload: dict) -> dict:
     return {
         "status": int(response.status_code),
         "body": response.text,
+        "headers": [{"name": key, "value": value} for key, value in response.headers.multi_items()],
+        "request_headers": dict(getattr(getattr(response, "request", None), "headers", {}) or {}),
     }
 
 
