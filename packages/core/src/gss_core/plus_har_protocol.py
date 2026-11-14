@@ -74,7 +74,8 @@ from gss_core.har_telemetry import (
     sentinel_ping,
 )
 from gss_core.saved_cards import restore_account
-from gss_core.saved_card_protocol import _factor, _stripe_error, outcome
+from gss_core.money import quote_from_payload
+from gss_core.saved_card_protocol import _factor, _minor, _stripe_error, outcome
 from gss_core.session_token import session_cookie_values
 from gss_core.stripe_protocol import PaymentOutcome
 
@@ -139,6 +140,7 @@ class PlusHarProtocol:
         self.proxy = proxy or None
         self.stripe_direct = stripe_direct
         self.currency = (currency or "USD").upper()
+        self.expected_currency = self.currency
         self.timeout = float(timeout or 120.0)
         self.plan = plan or "plus"
         # The card's billing country drives tax and AVS; the order country is
@@ -178,8 +180,8 @@ class PlusHarProtocol:
         self.telemetry: Optional[StripeTelemetry] = None
         self.t0 = time.time()
         self.amount_minor = 0
-        # 用户在页面上确认过的金额（order 金额）；税后高于它就要停下来重新确认。
-        self.expected_amount_minor = 0
+        # 用户确认过的币种或应付额变化时，先返回更新后的报价。
+        self.expected_amount_minor: Optional[int] = None
         self.customer_id = ""
         self.elements_session_id = ""
         self.passive_captcha: Dict[str, str] = {}
@@ -430,6 +432,7 @@ class PlusHarProtocol:
             self.cuss_secret = str(payload["customer_session_client_secret"])
         if payload.get("confirm_return_url"):
             self.confirm_return_url = str(payload["confirm_return_url"])
+        _, self.currency = quote_from_payload(payload, self.currency)
         self.raw["checkout"] = payload
         return payload
 
@@ -579,6 +582,7 @@ class PlusHarProtocol:
         if session.get("publishable_key"):
             self.publishable_key = str(session["publishable_key"])
         self.amount_minor = self._total_minor(session or payload)
+        _, self.currency = quote_from_payload(session or payload, self.currency)
         self.raw["taxes"] = payload
         logger.info("plus_har_taxes total=%s %s", self.amount_minor, self.currency)
 
@@ -867,7 +871,11 @@ class PlusHarProtocol:
                 out.state = "unknown"
                 out.message = f"Intent 金额 {amount} 与结账应付额 {self.amount_minor} 不一致；{out.message}"
                 return out
-            out.state = "card_declined"
+            if error.get("type") == "invalid_request_error":
+                out.state = "request_rejected"
+                out.code = out.code or "stripe_request_rejected"
+            else:
+                out.state = "card_declined"
             return out
         if self.last_error:
             out.code = self.last_error.get("code") or ""
@@ -997,21 +1005,26 @@ class PlusHarProtocol:
         return out
 
     def _quote_guard(self) -> Optional[PaymentOutcome]:
-        """税后金额高于用户确认值时暂停，等前端确认新报价再付。
+        """币种变化或税后金额升高时暂停，等前端确认新报价再付。
 
         HAR 里这是 UI 自动刷新金额后由人再点一次；纯协议没有这一步，所以这里
         主动返回 pending/checkout，前端已经有 `quoteChanged` 分支接这个状态。
         税后更低（优惠/免税）直接放行，按实际应付额收款。
         """
-        if not self.expected_amount_minor or self.amount_minor <= self.expected_amount_minor:
+        currency_changed = self.currency != self.expected_currency
+        amount_increased = self.expected_amount_minor is not None and self.amount_minor > self.expected_amount_minor
+        if not currency_changed and not amount_increased:
             return None
         self.stage = "checkout"
         out = PaymentOutcome()
         out.state = "pending"
-        out.message = "账单税费已更新，请确认当前应付金额后再提交付款"
+        if currency_changed:
+            out.message = "账单币种已更新，请确认当前币种和应付金额后再提交付款"
+        else:
+            out.message = "账单税费已更新，请确认当前应付金额后再提交付款"
         out.raw = self.raw
-        logger.info("plus_har_quote_changed expected=%s actual=%s",
-                    self.expected_amount_minor, self.amount_minor)
+        logger.info("plus_har_quote_changed expected=%s %s actual=%s %s",
+                    self.expected_amount_minor, self.expected_currency, self.amount_minor, self.currency)
         return out
 
     def _read_only_settle(self) -> PaymentOutcome:
@@ -1169,10 +1182,14 @@ def run_har_context(
         engine.intent_secret = str(context.get("intent_secret") or "")
     if context.get("confirmation_token"):
         engine.ctoken = str(context["confirmation_token"])
-    if context.get("amount_minor"):
+    if context.get("amount_minor") is not None:
         engine.amount_minor = int(context["amount_minor"])
         engine.expected_amount_minor = engine.amount_minor
     try:
+        engine.expected_currency = str(spec.get("expected_currency") or currency).upper()
+        expected_amount = spec.get("expected_amount", spec.get("amount"))
+        if expected_amount is not None:
+            engine.expected_amount_minor = _minor(expected_amount, engine.expected_currency)
         if spec.get("retry_route") and not read_only:
             engine.read_only = True
             result = engine.pay()
@@ -1180,9 +1197,13 @@ def run_har_context(
             open_checkout = page.get("status") == "open" and page.get("payment_status") == "unpaid"
             app_started = context.get("app_confirmation_started", context.get("har_stage") == "payment")
             if open_checkout and result.intent_status == "requires_confirmation" and engine.ctoken:
-                engine.read_only = False
-                engine._intent_confirm()
-                result = engine._settle()
+                stopped = engine._quote_guard()
+                if stopped is not None:
+                    result = stopped
+                else:
+                    engine.read_only = False
+                    engine._intent_confirm()
+                    result = engine._settle()
             elif open_checkout and (result.intent_status == "requires_payment_method" or not (app_started or engine.intent_id)):
                 if result.intent_status == "requires_payment_method":
                     for key in ("app_confirmation_started", "confirmation_token", "intent_id", "intent_secret"):
@@ -1215,12 +1236,12 @@ def run_har_context(
         if engine.intent_id:
             context["intent_id"] = engine.intent_id
             context["intent_secret"] = engine.intent_secret
-        if engine.amount_minor:
+        if engine.amount_minor or engine.raw.get("taxes"):
             context["amount_minor"] = engine.amount_minor
             # 税费后的应付额回写给订单视图（HAR 里 UI 也是按税后金额收款）
             context["quoted"] = True
-            context["amount"] = Decimal(engine.amount_minor) / _factor(currency)
-            context["currency"] = currency
+            context["amount"] = Decimal(engine.amount_minor) / _factor(engine.currency)
+            context["currency"] = engine.currency
         if engine.customer_id:
             context["customer_id"] = engine.customer_id
         pm = (engine.raw or {}).get("payment_method_id")

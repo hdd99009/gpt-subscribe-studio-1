@@ -154,6 +154,27 @@ def test_quote_from_payload_reads_major_and_minor_units() -> None:
     assert yen == Decimal("2980") and jpy == "JPY"
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("conversion_first", [False, True])
+@pytest.mark.parametrize("minor", [0, 98214, 110000])
+def test_checkout_quote_uses_actual_currency_with_conversion_context(wrapped, conversion_first, minor):
+    session = {
+        "billing_details": {"country": "US", "currency": "PHP"},
+        "checkout_state": {"currency": "php", "total": {"total": {"minorUnitsAmount": minor}}},
+    }
+    conversion = {"subscription_conversion_context": {"currency": "USD", "value": 20}}
+    session = {**conversion, **session} if conversion_first else {**session, **conversion}
+    payload = {"currency": "USD", "checkout_session": session} if wrapped else session
+    assert quote_from_payload(payload, "USD") == (Decimal(minor) / 100, "PHP")
+
+
+def test_conversion_context_does_not_supply_a_quote_currency_or_amount():
+    payload = {"subscription_conversion_context": {"currency": "USD", "amount_total": 2000}}
+    assert quote_from_payload(payload, "PHP") == (None, "PHP")
+    payload["invoice"] = {"currency": "JPY", "amount_due": 2980}
+    assert quote_from_payload(payload, "PHP") == (Decimal("2980"), "JPY")
+
+
 def test_quote_from_chatgpt_checkout_state_skips_tax_line() -> None:
     amount, currency = quote_from_payload(
         {

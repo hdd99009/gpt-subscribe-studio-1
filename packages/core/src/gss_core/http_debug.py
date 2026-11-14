@@ -286,12 +286,14 @@ def _curl_request(session: Any, method: str, url: str, values: dict) -> Exchange
     cookies.jar.add_cookie_header(cookie_request)
     if cookie_request.has_header("Cookie") and "cookie" not in headers:
         headers["cookie"] = cookie_request.get_header("Cookie")
-    data = values.get("data")
+    data = values.get("content")
+    if data is None:
+        data = values.get("data")
     if values.get("json") is not None:
         body = json.dumps(values["json"], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         headers.setdefault("content-type", "application/json")
-    elif isinstance(data, bytes):
-        body = data
+    elif isinstance(data, (bytes, bytearray)):
+        body = bytes(data)
     elif isinstance(data, str):
         body = data.encode("utf-8")
     elif data is not None:

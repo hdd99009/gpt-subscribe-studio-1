@@ -249,7 +249,12 @@ def test_sentinel_bridge_input_output_and_capture_context_are_exported(client, m
     assert bridge["state"] == "complete"
 
 
-def test_curl_transport_captures_cookie_form_headers_and_response(client):
+@pytest.mark.parametrize("body_argument", [
+    {"data": {"fixture": "full-form-value"}},
+    {"content": "fixture=full-form-value"},
+    {"content": b"fixture=full-form-value"},
+])
+def test_curl_transport_captures_cookie_form_headers_and_response(client, body_argument):
     from curl_cffi.requests import Session
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -269,7 +274,7 @@ def test_curl_transport_captures_cookie_form_headers_and_response(client):
         with Session(impersonate="chrome150", trust_env=False) as upstream:
             upstream.cookies.set("fixture", "original-cookie", domain="127.0.0.1")
             response = upstream.post(f"http://127.0.0.1:{server.server_port}/form?country=PH",
-                                     data={"fixture": "full-form-value"}, headers={"X-Fixture": "request-header"})
+                                     **body_argument, headers={"X-Fixture": "request-header"})
             assert response.status_code == 402
             assert "original-cookie" in response.json()["cookie"]
     finally:

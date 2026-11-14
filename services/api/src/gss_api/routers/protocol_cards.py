@@ -180,7 +180,7 @@ async def _apply(order, secrets, view, context: dict, result: dict) -> dict:
             store.update_status(order.id, OrderStatus.PAYING)
             store.update_status(order.id, OrderStatus.VERIFYING)
             await _mark_delivered(order.id, renewal_checked=bool(context.get("renewal")))
-        elif state == "card_declined":
+        elif state in {"card_declined", "request_rejected"}:
             store.update_status(order.id, OrderStatus.FAILED)
         elif state == "challenge_required":
             store.update_status(order.id, OrderStatus.REQUIRES_ACTION)

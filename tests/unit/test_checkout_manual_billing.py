@@ -72,6 +72,19 @@ def test_tax_update_acknowledgment_reads_updated_checkout_quote(monkeypatch):
     assert created.amount == Decimal("1234.56") and created.quote_error == ""
 
 
+@pytest.mark.parametrize("plan", ["plus", "go"])
+def test_checkout_uses_wrapped_php_tax_quote_with_usd_conversion_context(monkeypatch, plan):
+    value = client(monkeypatch, Response({"checkout_session": {
+        "subscription_conversion_context": {"currency": "USD", "value": 20},
+        "billing_details": {"country": "US", "currency": "PHP"},
+        "checkout_state": {"currency": "php", "total": {"total": {"minorUnitsAmount": 98214}}},
+    }}))
+    created = value.create_checkout(plan=plan, country="PH", billing=BILLING)
+    assert created.amount == Decimal("982.14")
+    assert created.currency == "PHP" and not created.quote_error
+    assert value._http.posts[-1][1]["json"]["currency"].upper() == "PHP"
+
+
 @pytest.mark.parametrize("response", [Response({}), Response({"error": "address rejected"}, 400)])
 def test_quote_failure_preserves_created_checkout_without_a_guessed_amount(monkeypatch, response):
     value = client(monkeypatch, response)

@@ -40,6 +40,8 @@ _MINOR_NAMES = (
 
 
 def quote_from_payload(payload: Any, default_currency: str = "") -> Tuple[Optional[Decimal], str]:
+    if isinstance(payload, dict) and isinstance(payload.get("checkout_session"), dict):
+        payload = payload["checkout_session"]
     currency = _currency_of(payload, default_currency)
     if isinstance(payload, dict):
         top = payload.get("amount_total")
@@ -84,6 +86,11 @@ def _minor_bucket(bucket: Any, currency: str) -> Optional[Decimal]:
 
 
 def _currency_of(payload: Any, default: str) -> str:
+    if isinstance(payload, dict):
+        for name in ("checkout_state", "billing_details"):
+            found = _find_string(payload.get(name), ("currency", "currency_code"), depth=0)
+            if found:
+                return found.upper()
     found = _find_string(payload, ("currency", "currency_code"), depth=0)
     return (found or default or "").strip().upper()
 
@@ -120,7 +127,9 @@ def _find_named(payload: Any, name: str, *, depth: int) -> Any:
     if isinstance(payload, dict):
         if name in payload and payload[name] is not None:
             return payload[name]
-        for value in payload.values():
+        for key, value in payload.items():
+            if key == "subscription_conversion_context":
+                continue
             found = _find_named(value, name, depth=depth + 1)
             if found is not None:
                 return found
@@ -140,7 +149,9 @@ def _find_string(payload: Any, names: tuple[str, ...], *, depth: int) -> str:
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        for value in payload.values():
+        for key, value in payload.items():
+            if key == "subscription_conversion_context":
+                continue
             found = _find_string(value, names, depth=depth + 1)
             if found:
                 return found

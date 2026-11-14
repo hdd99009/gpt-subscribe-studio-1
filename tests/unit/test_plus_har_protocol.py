@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -492,6 +493,102 @@ def test_settle_flags_amount_mismatch():
     assert "不一致" in (result.message or "")
 
 
+def test_currency_parameter_error_is_a_request_rejection():
+    engine = build_harness(currency="PHP")
+    engine.amount_minor = 98214
+    engine.stage = "payment"
+    engine.raw["intent"] = {"error": {
+        "type": "invalid_request_error",
+        "param": "currency",
+        "message": "The provided currency (php) does not match the expected currency (usd).",
+        "payment_intent": {"status": "requires_payment_method", "amount": 98214, "currency": "php"},
+    }}
+    result = engine._settle()
+    assert result.state == "request_rejected"
+    assert result.code == "stripe_request_rejected"
+    assert not result.decline_code
+
+
+@pytest.mark.parametrize("plan", ["plus", "go"])
+@pytest.mark.parametrize("initial_currency,expected_currency,state", [
+    ("PHP", "PHP", "paid"),
+    ("USD", "PHP", "paid"),
+    ("PHP", "USD", "pending"),
+])
+def test_har_synchronizes_checkout_and_tax_currency(monkeypatch, plan, initial_currency, expected_currency, state):
+    engine = build_harness(currency=expected_currency, plan=plan)
+    original_request = engine.app.request
+    original_get = engine.stripe.get
+    elements = []
+    taxed = False
+
+    def request(method, url, **kwargs):
+        nonlocal taxed
+        response = original_request(method, url, **kwargs)
+        payload = response.json()
+        session = payload.get("checkout_session", payload)
+        if "checkout_state" in session:
+            taxed = taxed or url.endswith("/taxes")
+            currency = "PHP" if taxed else initial_currency
+            session["subscription_conversion_context"] = {"currency": "USD", "value": 20}
+            session["billing_details"] = {"country": "US", "currency": currency}
+            session["checkout_state"] = {
+                "currency": currency.lower(),
+                "total": {"total": {"minorUnitsAmount": 98214 if taxed else 110000}},
+            }
+        return response
+
+    def get(url, **kwargs):
+        if url.endswith("/v1/elements/sessions"):
+            elements.append(kwargs["params"])
+        return original_get(url, **kwargs)
+
+    engine.app.request = request
+    engine.stripe.get = get
+    monkeypatch.setattr("gss_core.plus_har_protocol.PlusHarProtocol", lambda **kwargs: engine)
+    context = {"amount_minor": 98214}
+    result = run_har_context(StubClient(), context, {
+        "currency": expected_currency, "expected_currency": expected_currency,
+        "expected_amount": "982.14", "plan": plan,
+    }, billing=engine.billing)
+    assert result["state"] == state
+    assert context["currency"] == "PHP"
+    assert context["amount"] == Decimal("982.14")
+    assert elements[0]["currency"] == initial_currency.lower()
+    taxes = next(body for method, route, body in engine.app.calls if route.endswith("/taxes"))
+    assert taxes["currency"] == initial_currency.lower()
+    if state == "paid":
+        assert len(elements) == 2
+        assert elements[1]["currency"] == "php"
+        assert elements[1]["deferred_intent[currency]"] == "php"
+        assert elements[1]["deferred_intent[amount]"] == "98214"
+    else:
+        assert result["stage"] == "checkout"
+        assert len(elements) == 1
+        assert all(route != "/v1/confirmation_tokens" for method, route in engine.stripe.calls)
+        assert not engine.app_confirmation_started
+
+
+def test_har_persists_corrected_zero_decimal_currency(monkeypatch):
+    engine = build_harness(currency="USD")
+    monkeypatch.setattr("gss_core.plus_har_protocol.PlusHarProtocol", lambda **kwargs: engine)
+    context = {"amount_minor": 1363}
+    result = run_har_context(StubClient(), context, {"currency": "USD", "expected_amount": "13.63"})
+    assert result["state"] == "pending" and result["stage"] == "checkout"
+    assert context["currency"] == "JPY"
+    assert context["amount"] == Decimal("1363")
+    assert not engine.app_confirmation_started
+
+
+def test_har_uses_the_current_confirmed_quote_after_an_update(monkeypatch):
+    engine = build_harness()
+    monkeypatch.setattr("gss_core.plus_har_protocol.PlusHarProtocol", lambda **kwargs: engine)
+    result = run_har_context(StubClient(), {"amount_minor": 100}, {
+        "currency": "JPY", "expected_currency": "JPY", "expected_amount": "1363",
+    })
+    assert result["state"] == "paid"
+
+
 def test_quote_guard_pauses_when_tax_raises_total():
     h = build_harness()
     h.expected_amount_minor = 2178
@@ -514,9 +611,15 @@ def test_quote_guard_allows_equal_or_lower_total():
 
 def test_quote_guard_skipped_without_expected():
     h = build_harness()
-    h.expected_amount_minor = 0
     h.amount_minor = 9999
     assert h._quote_guard() is None
+
+
+def test_quote_guard_requires_confirmation_when_a_free_quote_increases():
+    h = build_harness()
+    h.expected_amount_minor = 0
+    h.amount_minor = 100
+    assert h._quote_guard().state == "pending"
 
 
 def test_har_web_session_uses_cookie_chunks_without_stale_base(monkeypatch):

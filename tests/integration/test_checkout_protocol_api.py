@@ -243,6 +243,20 @@ def test_unused_get_is_local_and_has_no_writes(flow):
     assert not flow.state["calls"]
 
 
+def test_payment_request_rejection_has_a_final_failed_order(flow, monkeypatch):
+    def reject(client, context, spec, **kwargs):
+        context["app_confirmation_started"] = True
+        return {"state": "request_rejected", "stage": "payment",
+                "code": "stripe_request_rejected", "message": "Currency does not match Stripe Elements"}
+
+    monkeypatch.setattr("gss_api.routers.protocol_cards.run_checkout_protocol", reject)
+    result = post(flow)
+    assert result["state"] == "request_rejected"
+    assert result["order"]["status"] == "failed"
+    assert result["payment_confirmed"] is False
+    assert get(flow)["state"] == "request_rejected"
+
+
 def test_stripe_direct_choice_reaches_payment_and_status_clients(flow, monkeypatch):
     from gss_api.routers import protocol_cards
 
