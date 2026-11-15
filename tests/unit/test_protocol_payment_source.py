@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -13,6 +15,7 @@ os.environ.setdefault("GSS_USE_FAKE", "1")
 from fastapi import HTTPException
 
 from gss_api.routers.orders import ProtocolPayRequest, resolve_protocol_payment_method
+from gss_core import stripe_protocol
 
 BILLING = {
     "email": "a@example.com",
@@ -65,3 +68,39 @@ def test_payment_method_id_must_look_like_stripe_id():
 def test_blank_payment_method_id_is_treated_as_absent():
     with pytest.raises(HTTPException):
         resolve_protocol_payment_method(_payload(payment_method_id="   "))
+
+
+@pytest.mark.parametrize("curl_transport", [True, False])
+def test_hosted_direct_transport_disables_environment_proxies(monkeypatch, curl_transport):
+    received = []
+
+    def transport(**kwargs):
+        received.append(kwargs)
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(stripe_protocol, "_HAS_CURL_CFFI", curl_transport)
+    monkeypatch.setattr(stripe_protocol, "curl_requests", SimpleNamespace(Session=transport))
+    monkeypatch.setattr(stripe_protocol.httpx, "Client", transport)
+    engine = stripe_protocol.StripeProtocol(proxy="http://fixed.invalid:3000", stripe_direct=True)
+    engine._http()
+    assert engine.proxy is None
+    assert received[0]["trust_env"] is False
+    if curl_transport:
+        assert received[0]["proxies"] == {"http": "", "https": ""}
+    else:
+        assert received[0]["proxy"] is None
+    engine.close()
+
+
+def test_hosted_init_uses_the_order_publishable_key(monkeypatch):
+    engine = stripe_protocol.StripeProtocol(publishable_key="pk_test_order")
+    sent = []
+
+    def post(url, body, headers):
+        sent.append(parse_qs(body))
+        return SimpleNamespace(status_code=200, json=lambda: {"total_summary": {"due": 100}})
+
+    monkeypatch.setattr(engine, "_post", post)
+    monkeypatch.setattr(engine, "_align_locale", lambda proxy: ("en-US", "UTC"))
+    engine.init_checkout("cs_test_fixture")
+    assert sent[0]["key"] == ["pk_test_order"]

@@ -11,6 +11,7 @@ from gss_contracts import AdapterCapabilities, PaymentRequest, PaymentResult, Pa
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.hosted import TeamHostedClient
+from gss_core.saved_cards import session_snapshot
 from gss_core.chatgpt import (
     APP_BASE,
     ChatGPTClient,
@@ -82,31 +83,36 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         if not checkout_id:
             raise DomainError(ErrorCode.PAYMENT_DECLINED, "缺少 checkout_session_id")
 
-        # The exit must match the billing country of the payment method. A checkout
-        # created for one region but billed to another otherwise looks inconsistent to
-        # Stripe and forces an extra verification step.
+        # Keep the selected order exit throughout payment. Resolve a configured
+        # fallback only for callers that have not selected an order proxy.
         billing_country = str((req.billing or {}).get("country") or "").upper()
         target_country = billing_country if str(req.plan or "").lower() == "team" and billing_country else req.country
-        proxy = align_proxy_region(
-            req.checkout_proxy
-            or req.approve_proxy
-            or session_proxy("checkout", target_country)
+        proxy = req.checkout_proxy or req.approve_proxy or align_proxy_region(
+            session_proxy("checkout", target_country)
             or configured_proxy("checkout")
             or configured_proxy("approve"),
             target_country,
         )
-        client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
+        context = req.session_context or {}
+        client = ChatGPTClient.from_raw_session(context.get("session") or req.session, proxy=proxy)
         client.timeout = float(self.timeout)
         client.language = locale_for(target_country)
         client.timezone = timezone_for(target_country)
-        if str(req.plan or "").lower() == "team" and public_checkout_id(checkout_id).startswith("cs_"):
-            try:
+        try:
+            if str(req.plan or "").lower() == "team" and public_checkout_id(checkout_id).startswith("cs_"):
                 return await asyncio.to_thread(self._pay_team, client, req)
+            return await asyncio.to_thread(self._pay_custom, client, req)
+        finally:
+            try:
+                if req.session_context is not None:
+                    req.session_context["session"] = session_snapshot(client)
             finally:
                 client.close()
+
+    def _pay_custom(self, client: ChatGPTClient, req: PaymentRequest) -> PaymentResult:
+        checkout_id = req.checkout_session_id or ""
         page_url = req.checkout_url if str(req.checkout_url or "").startswith(APP_BASE) else f"{APP_BASE}/"
-        # 支付阶段出口同样已对齐账单国：先刷新 session 再 warmup，
-        # 让确认请求的 cookie/凭证与本批次出口同批次。软失败不阻断。
+        # 在订单出口上刷新 session 并预热页面，再使用本批次凭证确认付款。
         client.refresh_session()
         client.warmup(page_url=page_url)
         pk = req.publishable_key or ""
@@ -220,6 +226,7 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
 
 
     def _pay_team(self, client: ChatGPTClient, req: PaymentRequest) -> PaymentResult:
+        client.refresh_session()
         if not req.publishable_key:
             raise DomainError(ErrorCode.PAYMENT_UNKNOWN_STATE, "缺少 Stripe 公钥，请打开官方长链")
         hosted = TeamHostedClient(client)

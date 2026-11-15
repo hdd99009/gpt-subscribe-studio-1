@@ -349,6 +349,9 @@ export interface BindAndPayProtocolResult extends ProtocolPayResult {
 }
 
 export interface ProtocolPayInput {
+  stripe_direct?: boolean;
+  expected_amount?: string;
+  expected_currency?: string;
   /** 服务端直接提交卡号（全协议）。与 payment_method_id 二选一。 */
   card?: { number: string; cvc: string; exp_month: string; exp_year: string };
   /** 浏览器 Stripe 输入框已换好的 pm_（混合模式）。与 card 二选一。 */

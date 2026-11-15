@@ -25,6 +25,7 @@ class OrderSecrets:
     client_version: str = ""
     oai_session_id: str = ""
     proxy: str = ""
+    stripe_direct: bool = False
     # 建单时选定的指纹 profile，支付与求解器必须复用同一份
     profile: Optional[Dict[str, Any]] = None
     billing: Dict[str, str] = field(default_factory=dict)

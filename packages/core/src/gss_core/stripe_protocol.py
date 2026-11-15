@@ -157,8 +157,14 @@ class StripeProtocol:
         billing: dict[str, str] | None = None,
         timeout: float = 120.0,
         profile: dict | None = None,
+        publishable_key: str = "",
+        allow_proxy_retry: bool = True,
+        stripe_direct: bool = False,
     ) -> None:
-        self.proxy = proxy or None
+        self.stripe_direct = stripe_direct
+        self.proxy = None if stripe_direct else proxy or None
+        self.publishable_key = publishable_key or PUBLISHABLE_KEY
+        self.allow_proxy_retry = allow_proxy_retry
         self.locale = ""
         self.timezone = ""
         # 指纹必须与建单、求解器完全一致：由调用方传入同一份 profile
@@ -213,19 +219,20 @@ class StripeProtocol:
         """返回一个会话；优先 curl_cffi（可模拟 Chrome 的 TLS/JA3 指纹）。"""
         if self._client is None:
             if _HAS_CURL_CFFI and curl_requests is not None:
-                proxies = None
+                proxies = {"http": "", "https": ""} if self.stripe_direct else None
                 if self.proxy:
                     proxies = {"http": self.proxy, "https": self.proxy}
                 self._client = curl_requests.Session(
                     impersonate="chrome150",
                     proxies=proxies,
                     timeout=self.timeout,
+                    trust_env=not self.stripe_direct,
                     headers={"Accept": "application/json"},
                 )
                 log("   使用 curl_cffi（Chrome TLS 指纹）")
             else:
                 self._client = httpx.Client(
-                    proxy=self.proxy, timeout=self.timeout,
+                    proxy=self.proxy, timeout=self.timeout, trust_env=not self.stripe_direct,
                     headers={"User-Agent": self.ua, "Accept": "application/json"},
                 )
                 log("   使用 httpx（默认 TLS 指纹）")
@@ -485,7 +492,7 @@ class StripeProtocol:
         """
         r = self._get(
             f"{STRIPE_API}/v1/payment_pages/allowed_origins",
-            {"key": PUBLISHABLE_KEY},
+            {"key": self.publishable_key},
             {"Accept": "application/json",
              "Origin": "https://js.stripe.com",
              "Referer": "https://js.stripe.com/",
@@ -505,7 +512,7 @@ class StripeProtocol:
             "browser_locale": locale,
             "browser_timezone": tz,
             "eid": "NA",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "redirect_type": "url",
         }
         r = self._post(
@@ -549,7 +556,7 @@ class StripeProtocol:
             "deferred_intent[setup_future_usage]": "off_session",
             "elements_init_source": "checkout",
             "hosted_surface": "checkout",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "locale": locale,
             "referrer_host": "pay.openai.com",
             "stripe_js_id": ctx.stripe_js_id,
@@ -574,7 +581,7 @@ class StripeProtocol:
         log("④ 提交 tax_region（country）")
         data = {
             "eid": "NA",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "tax_region[country]": self.billing.get("country", "US"),
         }
         r = self._post(f"{STRIPE_API}/v1/payment_pages/{cs_id}",
@@ -637,7 +644,7 @@ class StripeProtocol:
             "client_attribution_metadata[merchant_integration_version]": "hosted_checkout",
             "client_attribution_metadata[payment_method_selection_flow]": "merchant_specified",
             "guid": fp.guid, "muid": fp.muid, "sid": fp.sid,
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "_stripe_version": V_HOSTED,
         }
         r = self._post(
@@ -665,7 +672,7 @@ class StripeProtocol:
             "expected_payment_method_type": "card",
             "_stripe_version": V_HOSTED,
             "guid": fp.guid, "muid": fp.muid, "sid": fp.sid,
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             "link_brand": "link",
             "client_attribution_metadata[client_session_id]": fp.client_session_id,
             "client_attribution_metadata[checkout_session_id]": cs_id,
@@ -745,7 +752,7 @@ class StripeProtocol:
             "client_secret": client_secret,
             "challenge_response_token": token,
             "captcha_vendor_name": "hcaptcha",
-            "key": PUBLISHABLE_KEY,
+            "key": self.publishable_key,
             # 挑战来自 hosted checkout（payment_pages/{cs}/confirm），
             # 版本必须和该流程一致；用 V_FULL 会让 token 被判无效。
             "_stripe_version": V_HOSTED,
@@ -769,7 +776,7 @@ class StripeProtocol:
             time.sleep(2)
             r = self._get(
                 f"{STRIPE_API}/v1/payment_pages/{cs_id}/poll",
-                {"key": PUBLISHABLE_KEY, "_stripe_version": V_BASE},
+                {"key": self.publishable_key, "_stripe_version": V_BASE},
                 STRIPE_HEADERS,
             )
             try:
@@ -878,14 +885,14 @@ class StripeProtocol:
         # 首次执行，遇到代理故障自动轮换重试
         last_exc = None
         outcome = None
-        for proxy_try in range(3):
+        for proxy_try in range(3 if self.allow_proxy_retry else 1):
             try:
                 outcome = self.pay(cs_id)
                 break
             except Exception as e:
                 last_exc = e
                 msg = str(e)
-                if "SSL" in msg or "ConnectError" in msg or "EOF" in msg:
+                if self.allow_proxy_retry and ("SSL" in msg or "ConnectError" in msg or "EOF" in msg):
                     self.rotate_proxy_sid()
                     self._client = None
                     time.sleep(2)

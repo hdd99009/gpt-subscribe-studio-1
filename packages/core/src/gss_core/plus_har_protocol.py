@@ -54,11 +54,13 @@ from gss_core.chatgpt import (
     STRIPE_API_VERSION,
     STRIPE_BASE,
     ChatGPTClient,
+    _PLAN_NAME,
     _json,
     payment_intent_from_confirm,
     public_checkout_id,
     redact_sensitive,
     stripe_verify_url,
+    subscription_matches_plan,
 )
 from gss_core.har_device import DeviceProfile, device_for_account, g_state_cookie, oai_telemetry_header
 from gss_core.har_telemetry import (
@@ -383,7 +385,7 @@ class PlusHarProtocol:
     # ── 1. checkout create / read ──────────────────────────────────
     def _create_checkout(self) -> Dict[str, Any]:
         body: Dict[str, Any] = {
-            "plan_name": "chatgptplusplan" if self.plan == "plus" else f"chatgpt{self.plan}plan",
+            "plan_name": _PLAN_NAME[self.plan],
             "checkout_source": "chatgpt_web_merged",
             "entry_point": "all_plans_pricing_modal",
             "billing_details": {"country": self.country, "currency": self.currency},
@@ -825,9 +827,8 @@ class PlusHarProtocol:
         except Exception:  # noqa: BLE001
             return False
         entitlement = payload.get("entitlement") if isinstance(payload.get("entitlement"), dict) else {}
-        plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
         active = payload.get("is_active") is True or entitlement.get("has_active_subscription") is True
-        return plan in {self.plan, f"chatgpt{self.plan}plan"} and active
+        return subscription_matches_plan(payload, self.plan) and active
 
     def _ack_checkout(self) -> bool:
         body = {"stripe_checkout_session_id": self.checkout_id,

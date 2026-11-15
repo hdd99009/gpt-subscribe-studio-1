@@ -41,3 +41,23 @@ export function protocolCardError(card: TeamCardPayload): string | null {
   if (!/^(?:\d{2}|\d{4})$/.test(card.exp_year)) return "请填写两位或四位到期年份。";
   return null;
 }
+
+export function parseProtocolCardText(text: string): TeamCardPayload {
+  const normalized = text.normalize("NFKC").trim();
+  const numbers = [...normalized.matchAll(/(?:^|[;\r\n])\s*卡号\s*:\s*([\d -]+)\s*(?=[;\r\n]|$)/g)];
+  const codes = [...normalized.matchAll(/(?:^|[;\r\n])\s*(?:CVV|CVC)\s*:?\s*(\d+)\s*(?=[;\r\n]|$)/gi)];
+  const expiries = [...normalized.matchAll(/(?:^|[;\r\n])\s*有效期\s*:\s*(\d{1,2})\s*\/\s*(\d{2}|\d{4})\s*(?=[;\r\n]|$)/g)];
+  if (numbers.length !== 1 || codes.length !== 1 || expiries.length !== 1) {
+    throw new Error("请填写一张卡的完整信息，格式为“卡号:完整卡号;CVV123;有效期:11/28”。");
+  }
+  const year = expiries[0][2];
+  const card = {
+    number: numbers[0][1].replace(/[\s-]/g, ""),
+    cvc: codes[0][1],
+    exp_month: expiries[0][1].padStart(2, "0"),
+    exp_year: year.length === 2 ? "20" + year : year,
+  };
+  const error = protocolCardError(card);
+  if (error) throw new Error(error);
+  return card;
+}

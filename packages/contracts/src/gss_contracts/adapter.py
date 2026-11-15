@@ -48,6 +48,8 @@ class CheckoutRequest:
     seat_quantity: int = 5
     price_interval: str = "month"
     billing: Optional[Dict[str, str]] = field(default=None, repr=False)
+    # Latest credentials are handed back to the caller in memory, including on retries.
+    session_context: Optional[Dict[str, str]] = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,7 @@ class PaymentRequest:
     team_context: Optional[Dict[str, Any]] = None
     passive_captcha_token: Optional[str] = None
     rv_timestamp: Optional[str] = None
+    session_context: Optional[Dict[str, str]] = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)

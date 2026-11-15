@@ -24,6 +24,7 @@ import { StripeCardFields, type StripeCardHandle } from "../card-payment/CardFie
 
 import { formatAmount, payProtocol, payOrder, getOrder, verifyOrder, type BillingInput, type ProtocolPayResult, type Order } from "../api/client";
 import { randomBillingExample } from "../card-payment/billingExamples";
+import { CardImport } from "../card-payment/CardImport";
 
 interface Props {
   orderId: string;
@@ -149,6 +150,7 @@ function LegacyProtocolPayPanel({
   // 取 pm_ 的方式由上层持有（提链前就能选），这里只保留输入框句柄
   const [stripeCard, setStripeCard] = useState<StripeCardHandle | null>(null);
   const [proxy, setProxy] = useState("");
+  const [stripeDirect, setStripeDirect] = useState(false);
   // 协议链路的可选环节，全部默认关闭 = 与 scripts/run_cards.py 一致的批量模式
   const [steps, setSteps] = useState({
     fingerprint: false,
@@ -161,6 +163,7 @@ function LegacyProtocolPayPanel({
   const [result, setResult] = useState<ProtocolPayResult | null>(null);
   const [paymentSubmitted, setPaymentSubmitted] = useState(false);
   function applyBrowserOrder(next: Order) {
+    setPaymentSubmitted(next.status !== "awaiting_payment");
     const state = ["active", "delivered"].includes(next.status) ? "paid"
       : next.status === "requires_action" ? "challenge_required"
       : next.status === "failed" ? "card_declined" : "pending";
@@ -186,7 +189,7 @@ function LegacyProtocolPayPanel({
     setBilling({ ...billing, [field]: event.currentTarget.value });
 
   async function run() {
-    if (disabled || busy || (browserPayment && (paymentSubmitted || submissionDisabled))) return;
+    if (disabled || busy || paymentSubmitted || submissionDisabled) return;
     setError(null);
     setResult(null);
 
@@ -201,7 +204,10 @@ function LegacyProtocolPayPanel({
     }
 
     const payloadBilling = { ...billing, country: (billing.country || "US").toUpperCase() };
-    const shared = { billing: payloadBilling, proxy: proxy.trim() || undefined, steps };
+    const shared = {
+      billing: payloadBilling, proxy: proxy.trim() || undefined, steps, stripe_direct: stripeDirect,
+      expected_amount: amount || undefined, expected_currency: currency || undefined,
+    };
 
     // ── 方式一：浏览器 Stripe 输入框换 pm_ ──────────────
     if (pmMode === "stripe") {
@@ -221,17 +227,16 @@ function LegacyProtocolPayPanel({
         });
         if (browserPayment) {
           setPaymentSubmitted(true);
-          try { applyBrowserOrder(await payOrder(orderId, pmId, payloadBilling, undefined, stripeCard.last4 || undefined)); }
-          catch (err) {
-            const latest = await getOrder(orderId).catch(() => null);
-            if (latest && latest.status !== "awaiting_payment") applyBrowserOrder(latest);
-            throw err;
-          }
+          applyBrowserOrder(await payOrder(orderId, pmId, payloadBilling, undefined, stripeCard.last4 || undefined));
         } else {
+          setPaymentSubmitted(true);
           const out = await payProtocol(orderId, { ...shared, payment_method_id: pmId, card_last4: stripeCard.last4 || undefined });
+          setPaymentSubmitted(out.order?.status !== "awaiting_payment");
           setResult(out); onDone?.(out);
         }
       } catch (err) {
+        const latest = await getOrder(orderId).catch(() => null);
+        if (latest) applyBrowserOrder(latest);
         setError(err instanceof Error ? err.message : "Stripe 输入框支付失败");
       } finally {
         setBusy(false);
@@ -247,14 +252,18 @@ function LegacyProtocolPayPanel({
     if (!/^\d{2}$|^\d{4}$/.test(card.exp_year)) return setError("到期年份填 YY 或 YYYY。");
 
     setBusy(true);
+    setPaymentSubmitted(true);
     try {
       const out = await payProtocol(orderId, {
         ...shared,
         card: { number, cvc: card.cvc, exp_month: card.exp_month, exp_year: card.exp_year },
       });
+      setPaymentSubmitted(out.order?.status !== "awaiting_payment");
       setResult(out);
       onDone?.(out);
     } catch (err) {
+      const latest = await getOrder(orderId).catch(() => null);
+      if (latest) applyBrowserOrder(latest);
       setError(err instanceof Error ? err.message : "协议支付失败");
     } finally {
       setBusy(false);
@@ -361,6 +370,7 @@ function LegacyProtocolPayPanel({
       ) : (
         <Paper withBorder p="md" radius="md">
           <Stack gap="sm">
+            <CardImport onImport={setCard} disabled={busy || disabled} />
             <TextInput label="卡号" value={card.number} onChange={changeCard("number")}
               inputMode="numeric" autoComplete="off" disabled={busy || disabled} placeholder="4242424242424242" />
             <SimpleGrid cols={{ base: 1, xs: 3 }}>
@@ -447,7 +457,7 @@ function LegacyProtocolPayPanel({
 
       <Textarea
         label="指定代理（可选）"
-        description="留空则用「代理设置」里 checkout 的网关，并按账单国家自动对齐地区。"
+        description="留空则沿用创建结账时的订单代理。"
         placeholder="http://user:pass@host:3010"
         value={proxy}
         onChange={(event) => setProxy(event.currentTarget.value)}
@@ -456,6 +466,11 @@ function LegacyProtocolPayPanel({
         maxRows={2}
         disabled={busy || disabled}
       /></>}
+
+      <Checkbox label="Stripe 支付直连" checked={stripeDirect}
+        description="Stripe 请求使用本机网络，订阅查询与取消续费沿用订单代理。"
+        disabled={busy || disabled || paymentSubmitted || submissionDisabled}
+        onChange={(event) => setStripeDirect(event.currentTarget.checked)} />
 
       <Group justify="space-between" align="center">
         <Text size="xs" c="dimmed">
@@ -467,14 +482,14 @@ function LegacyProtocolPayPanel({
           type="button"
           size="md"
           loading={busy}
-          disabled={disabled || busy || !price || (browserPayment && (paymentSubmitted || submissionDisabled))}
+          disabled={disabled || busy || !price || paymentSubmitted || submissionDisabled}
           onClick={() => void run()}
         >
           {busy ? "提交中…" : !price ? "等待报价" : `确认支付 ${price}`}
         </Button>
       </Group>
 
-      {browserPayment && paymentSubmitted && <Button type="button" variant="default" disabled={busy || disabled} onClick={() => void queryBrowserPayment()}>查询支付状态</Button>}
+      {(paymentSubmitted || result) && <Button type="button" variant="default" disabled={busy || disabled} onClick={() => void queryBrowserPayment()}>查询支付状态</Button>}
       {busy && !browserPayment && (
         <Paper withBorder p="md" radius="md">
           <Text size="sm" fw={600} mb="xs">服务端正在跑这条链路</Text>

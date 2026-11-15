@@ -72,6 +72,7 @@ class OrderPipeline:
         seat_quantity: int = 5,
         price_interval: str = "month",
         billing: Optional[Dict[str, str]] = None,
+        session_context: Optional[Dict[str, str]] = None,
     ) -> CheckoutResult:
         """阶段一：生成托管结账链接。``mode`` 非法时拒绝（含 promo 未确认）。"""
 
@@ -89,6 +90,7 @@ class OrderPipeline:
             seat_quantity=seat_quantity,
             price_interval=price_interval,
             billing=dict(billing) if billing is not None else None,
+            session_context=session_context,
         )
         return await self.deps.checkout.create_checkout(req)
 
@@ -110,6 +112,7 @@ class OrderPipeline:
         team_context: Optional[Dict[str, Any]] = None,
         passive_captcha_token: Optional[str] = None,
         rv_timestamp: Optional[str] = None,
+        session_context: Optional[Dict[str, str]] = None,
     ) -> PaymentResult:
         """阶段二：卡支付。按 ``card_source`` 校验必备入参（凭证只在此处入参传递）。"""
 
@@ -134,6 +137,7 @@ class OrderPipeline:
             publishable_key=publishable_key,
             billing=billing, plan=plan, team_context=team_context,
             passive_captcha_token=passive_captcha_token, rv_timestamp=rv_timestamp,
+            session_context=session_context,
         )
         return await self.deps.payment.pay(req)
 

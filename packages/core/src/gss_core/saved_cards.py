@@ -37,6 +37,8 @@ def verification_session(client: ChatGPTClient, expected_account: str) -> str:
 
 def session_snapshot(client: ChatGPTClient) -> str:
     """Serialize the latest credentials without another upstream request."""
+    if getattr(client, "_http", None) is not None:
+        client._merge_cookies()
     return json.dumps({
         "accessToken": client.access_token,
         "sessionToken": client.session_token,

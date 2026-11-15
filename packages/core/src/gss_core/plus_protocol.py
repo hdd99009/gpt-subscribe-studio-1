@@ -75,6 +75,7 @@ class PlusProtocol:
         timeout: float = 120.0,
         profile: Optional[Dict[str, Any]] = None,
         customer_session_client_secret: str = "",
+        stripe_direct: bool = False,
     ) -> None:
         self.session = session or ""
         self.checkout_url = checkout_url or ""
@@ -82,6 +83,7 @@ class PlusProtocol:
         self.card = card or {}
         self.billing = billing or {}
         self.proxy = proxy or None
+        self.stripe_direct = stripe_direct
         # 指纹必须与建单、求解器完全一致
         self.profile = dict(profile or {})
         if self.profile:
@@ -125,6 +127,7 @@ class PlusProtocol:
         self.is_stripe_custom = self.checkout_id.startswith("cs_")
 
         self.client = ChatGPTClient.from_raw_session(self.session, proxy=self.proxy)
+        self.client.stripe_direct = self.stripe_direct
         self.client.timeout = timeout
         self._http: Optional[httpx.Client] = None
 
@@ -144,7 +147,8 @@ class PlusProtocol:
     def _stripe(self) -> httpx.Client:
         if self._http is None:
             self._http = httpx.Client(
-                proxy=self.proxy,
+                proxy=None if self.stripe_direct else self.proxy,
+                trust_env=not self.stripe_direct,
                 timeout=self.timeout,
                 verify=False,
                 headers={
@@ -166,6 +170,7 @@ class PlusProtocol:
         log(f"   轮换出口 SID → {self.proxy.split('@')[-1]}")
         self.close()
         self.client = ChatGPTClient.from_raw_session(self.session, proxy=self.proxy)
+        self.client.stripe_direct = self.stripe_direct
         self.client.timeout = self.timeout
 
     # ── ② pm_ ────────────────────────────────────────────

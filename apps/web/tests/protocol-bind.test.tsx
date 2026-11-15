@@ -16,14 +16,14 @@ import {
   type Order,
   type Plan,
 } from "../src/api/client";
-import { PROTOCOL_STAGE_LABELS, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../src/card-payment/protocolBind";
+import { PROTOCOL_STAGE_LABELS, parseProtocolCardText, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../src/card-payment/protocolBind";
 import { ProtocolPayPanel } from "../src/components/ProtocolPayPanel";
 import { ResultPanel } from "../src/components/ResultPanel";
 import { HistoryTable } from "../src/components/HistoryTable";
 import { loadHistory, recordOrder } from "../src/api/history";
 import { elementPaymentMethod } from "../src/card-payment/stripePaymentMethod";
 import { OrderNew } from "../src/pages/OrderNew";
-import { isPlusOrGo } from "../src/plans";
+import { isPersonalPlan, isPlusOrGo, planLabel } from "../src/plans";
 import { App } from "../src/App";
 import { MemoryOrders } from "../src/components/MemoryOrders";
 import { subscribeOrderUpdates } from "../src/api/events";
@@ -43,6 +43,46 @@ function renderPanel(plan: Plan = "plus") {
     plan={plan} bindBeforePay country="DE" sessionEmail="fixture@example.invalid" amount="20" currency="usd"
     publishableKey="pk_test_fixture" checkoutUrl={order.checkout_url} pmMode="stripe" /></form></MantineProvider>);
 }
+
+test("card import reads labeled PAN CVV and expiry with Chinese punctuation and preserves leading zeroes", () => {
+  const cardLine = "卡号:" + input.card.number;
+  const spacedNumber = input.card.number.match(/.{4}/g)!.join(" ");
+  const cases = [
+    { text: cardLine + ";CVV123;有效期:11/28", month: "11", cvc: "123" },
+    { text: " 卡号：" + spacedNumber + "；cvc：012；有效期：１／２０２８ ", month: "01", cvc: "012" },
+    { text: "有效期:11/2028\nCVV:1234\n" + cardLine, month: "11", cvc: "1234" },
+  ];
+  for (const example of cases) {
+    assert.deepEqual(parseProtocolCardText(example.text), {
+      number: input.card.number, cvc: example.cvc, exp_month: example.month, exp_year: "2028",
+    });
+  }
+});
+
+test("card import rejects masked incomplete invalid and multiple card records", () => {
+  const valid = "卡号:" + input.card.number + ";CVV123;有效期:11/28";
+  for (const text of [
+    "", "卡号:5378************;CVV123;有效期:11/28",
+    "卡号:" + input.card.number + ";有效期:11/28",
+    valid.replace("CVV123", "CVV12"),
+    valid.replace("11/28", "13/28"),
+    valid.replace("11/28", "11/203"),
+    valid + "\n" + valid,
+  ]) {
+    assert.throws(() => parseProtocolCardText(text));
+  }
+});
+
+test("card import is available on Plus Go and the legacy protocol card form", () => {
+  for (const plan of ["plus", "go"] as const) {
+    const html = renderPanel(plan);
+    assert.ok(html.includes('data-testid="card-import"'));
+    assert.ok(html.includes("一键导入"));
+  }
+  const html = renderToStaticMarkup(<MantineProvider><ProtocolPayPanel orderId="fixture"
+    plan="pro" country="US" pmMode="server" amount="100" currency="USD" /></MantineProvider>);
+  assert.ok(html.includes('data-testid="card-import"'));
+});
 
 test("Plus bindBeforePay renders server card inputs and never renders Stripe or saved-card components", () => {
   const html = renderPanel();
@@ -83,6 +123,20 @@ test("Go uses the shared checkout protocol and renders its own plan label", () =
   assert.ok(html.includes("Stripe 支付直连"));
   assert.ok(html.includes("confirmation_tokens"));
   assert.ok(html.includes("查询协议状态"));
+});
+
+test("all three Pro tiers use the personal checkout flow and shared protocol panel", () => {
+  for (const plan of ["pro_lite", "pro", "pro_max"] as const) {
+    assert.equal(isPersonalPlan(plan), true);
+    const html = renderPanel(plan);
+    assert.ok(html.includes('data-testid="' + plan + '-protocol-pay-panel"'));
+    assert.ok(html.includes(planLabel(plan) + " 协议支付"));
+    assert.ok(html.includes("Stripe 支付直连"));
+    assert.ok(html.includes("查询协议状态"));
+    assert.ok(html.includes("一键导入"));
+  }
+  assert.equal(isPersonalPlan("team"), false);
+  assert.equal(isPersonalPlan(undefined), false);
 });
 
 test("memory orders have a dedicated tab and explicit refresh and clear controls", () => {

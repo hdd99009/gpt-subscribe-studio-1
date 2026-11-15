@@ -42,6 +42,9 @@ class _StubChatGPTClient:
         self.calls.append("refresh")
         return True
 
+    def close(self) -> None:
+        self.calls.append("close")
+
     def warmup(self, *, page_url: str = "") -> None:
         self.calls.append("warmup")
 
@@ -96,6 +99,7 @@ def test_custom_cs_approve_rejected_still_raises(monkeypatch: pytest.MonkeyPatch
 
     with pytest.raises(DomainError):
         _pay(plan="plus")
+    assert client.calls[-1] == "close"
 
 
 # Dedicated Hosted pipeline and missing context tests are in test_hosted_protocol.py.

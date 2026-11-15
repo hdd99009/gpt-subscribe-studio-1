@@ -32,7 +32,7 @@ def _legacy_engine(monkeypatch):
     monkeypatch.setenv("GSS_PLUS_ENGINE", "legacy")
 
 
-@pytest.fixture(params=["plus", "go"])
+@pytest.fixture(params=["plus", "go", "pro_lite", "pro", "pro_max"])
 def flow(monkeypatch, request):
     plan = request.param
     state = {"calls": [], "violations": [], "account": "account_fixture", "minor": 1363,
@@ -685,7 +685,7 @@ def test_legacy_routes_block_current_pending_flow(flow,suffix,method):
     body = {"payment_method_token":"pm_fixture"} if suffix == "/pay" else {"payment_method_id":"pm_fixture","billing":flow.body["billing"]} if suffix == "/pay-protocol" else None
     before = list(flow.state["calls"])
     response = getattr(flow.api,method)(f"/api/orders/{flow.oid}"+suffix,**({"json":body} if body else {}))
-    expected_status = 404 if flow.plan == "go" and suffix.startswith("/saved-card") else 409
+    expected_status = 404 if flow.plan != "plus" and suffix.startswith("/saved-card") else 409
     assert response.status_code == expected_status, response.text
     assert flow.state["calls"] == before
 

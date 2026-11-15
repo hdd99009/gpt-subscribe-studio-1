@@ -243,7 +243,20 @@ def test_verified_intent_is_retained_if_post_payment_processing_fails(monkeypatc
     assert context["payment_confirmed"] is True
 
 
-@pytest.mark.parametrize("plan", ["plus", "go"])
+@pytest.mark.parametrize(("plan", "upstream_name"), [
+    ("plus", "chatgptplusplan"),
+    ("go", "chatgptgoplan"),
+    ("pro_lite", "chatgptprolite"),
+    ("pro", "chatgptpro"),
+    ("pro_max", "chatgptpromax"),
+])
+def test_har_checkout_uses_the_selected_personal_plan(plan, upstream_name):
+    engine = build_harness(plan=plan)
+    engine._create_checkout()
+    assert engine.app.calls[0][2]["plan_name"] == upstream_name
+
+
+@pytest.mark.parametrize("plan", ["plus", "go", "pro_lite", "pro", "pro_max"])
 def test_flow_order_matches_capture(plan):
     engine = build_harness(plan=plan)
     result = engine.pay()
@@ -373,7 +386,7 @@ def test_read_only_never_posts_payment(monkeypatch):
     assert posts == []
 
 
-@pytest.mark.parametrize("plan", ["plus", "go"])
+@pytest.mark.parametrize("plan", ["plus", "go", "pro_lite", "pro", "pro_max"])
 def test_run_har_context_persists_device_and_ids(monkeypatch, plan):
     calls = {}
 
@@ -416,7 +429,7 @@ def test_run_har_context_persists_device_and_ids(monkeypatch, plan):
     assert calls["plan"] == plan
 
 
-@pytest.mark.parametrize("plan", ["plus", "go"])
+@pytest.mark.parametrize("plan", ["plus", "go", "pro_lite", "pro", "pro_max"])
 def test_har_settlement_does_not_accept_another_subscription_plan(plan):
     engine = build_harness(plan=plan)
     engine._prepare()
@@ -509,7 +522,7 @@ def test_currency_parameter_error_is_a_request_rejection():
     assert not result.decline_code
 
 
-@pytest.mark.parametrize("plan", ["plus", "go"])
+@pytest.mark.parametrize("plan", ["plus", "go", "pro_lite", "pro", "pro_max"])
 @pytest.mark.parametrize("initial_currency,expected_currency,state", [
     ("PHP", "PHP", "paid"),
     ("USD", "PHP", "paid"),

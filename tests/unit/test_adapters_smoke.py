@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,3 +137,17 @@ def test_fake_account_reports_inactive_when_configured() -> None:
     assert info.active is False
     assert info.expires_at is None
     assert fake.sessions_seen == ["s"]
+
+
+@pytest.mark.parametrize("plan", ["plus", "go", "prolite", "pro", "promax", "team", "business"])
+@pytest.mark.parametrize("active", [True, False])
+def test_real_account_adapter_recognizes_all_subscription_tiers(monkeypatch, plan, active):
+    closed = []
+    client = SimpleNamespace(subscription_payload=lambda: {
+        "entitlement": {"subscription_plan": plan, "has_active_subscription": active},
+    }, close=lambda: closed.append(True))
+    monkeypatch.setattr("gss_account.adapter.ChatGPTClient.from_raw_session", lambda *args, **kwargs: client)
+    info = asyncio.run(UpstreamAccountAdapter().subscription_status("fixture-session"))
+    assert info.active is active
+    assert info.raw_kind == plan
+    assert closed == [True]

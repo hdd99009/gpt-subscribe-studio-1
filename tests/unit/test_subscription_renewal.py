@@ -73,6 +73,27 @@ def test_cancels_once_and_requires_subscription_readback(client_factory):
     assert headers["originator"] == "Codex Browser"
 
 
+@pytest.mark.parametrize("expected,reported", [
+    ("go", "go"), ("pro_lite", "prolite"), ("pro_lite", "chatgptprolite"),
+    ("pro", "pro"), ("pro", "chatgptpro"),
+    ("pro_max", "promax"), ("pro_max", "chatgptpromax"),
+    ("team", "team"), ("team", "business"), ("team", "chatgptbusinessplan"),
+])
+def test_each_plan_verifies_its_subscription_and_cancellation(client_factory, expected, reported):
+    before = {"plan_type": reported, "is_active": True, "will_renew": True}
+    after = {**before, "will_renew": False}
+    client, calls = client_factory([before, after])
+    assert client.cancel_subscription_renewal(expected_plan=expected)["will_renew"] is False
+    assert [call[0] for call in calls] == ["GET", "POST", "GET"]
+
+
+def test_another_pro_tier_cannot_be_cancelled_for_the_order(client_factory):
+    client, calls = client_factory([{"plan_type": "promax", "is_active": True, "will_renew": True}])
+    with pytest.raises(DomainError, match="套餐与订单不符"):
+        client.cancel_subscription_renewal(expected_plan="pro_lite")
+    assert [call[0] for call in calls] == ["GET"]
+
+
 def test_already_cancelled_is_a_read_only_success(client_factory):
     client, calls = client_factory([subscription(False)])
     assert client.cancel_subscription_renewal(expected_plan="plus")["already_cancelled"] is True

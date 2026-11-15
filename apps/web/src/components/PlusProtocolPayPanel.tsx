@@ -14,6 +14,7 @@ import {
 } from "../api/client";
 import { PROTOCOL_STAGE_LABELS, protocolBillingError, protocolCardError, protocolIsPaid, protocolPostReady, protocolStateLabel } from "../card-payment/protocolBind";
 import { planLabel } from "../plans";
+import { CardImport } from "../card-payment/CardImport";
 
 interface Props {
   orderId: string;
@@ -197,6 +198,7 @@ export function PlusProtocolPayPanel({
       <Text size="xs" c="dimmed">每个订单沿用首次提交的卡片和账单，修改资料请重新开始。付款确认后仍需等待订阅生效。切换连接方式再次提交时，会先核对原订单状态。</Text>
       <Paper withBorder p="md" radius="md">
         <Stack gap="sm">
+          <CardImport onImport={setCard} disabled={fieldsDisabled} />
           <TextInput label="卡号" value={card.number} onChange={changeCard("number")} inputMode="numeric" autoComplete="cc-number" disabled={fieldsDisabled} data-testid="protocol-card-number" />
           <SimpleGrid cols={{ base: 1, xs: 3 }}>
             <TextInput label="到期月份" value={card.exp_month} onChange={changeCard("exp_month")} inputMode="numeric" maxLength={2} autoComplete="cc-exp-month" disabled={fieldsDisabled} />

@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, status
@@ -64,6 +64,7 @@ logger = logging.getLogger("gss.orders")
 _team_locks: dict[str, asyncio.Lock] = {}
 _renewal_tasks: dict[str, asyncio.Task] = {}
 _checkout_tasks: dict[str, asyncio.Task] = {}
+_protocol_payment_tasks: dict[str, asyncio.Task] = {}
 
 
 def _assert_saved_card_resolved(secrets: OrderSecrets) -> None:
@@ -244,6 +245,7 @@ async def create_order(
         )
 
     raw_session = (payload.session or "").strip()
+    session_context = {"session": raw_session}
     try:
         bundle = parse_session_bundle(raw_session)
     except ValueError as exc:
@@ -274,7 +276,7 @@ async def create_order(
     if not bundle.access_token and bundle.session_token:
         client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy)
         try:
-            refreshed = await asyncio.to_thread(client.refresh_session)
+            refreshed = await asyncio.to_thread(client.refresh_session, force_refresh=True)
         except Exception as exc:
             logger.warning("session token 换取失败: %s", redact_sensitive(str(exc))[:200])
             refreshed = False
@@ -294,6 +296,7 @@ async def create_order(
             "sessionId": client.oai_session_id,
             "cookies": client.extra_cookies,
         })
+        session_context.update(session=raw_session, refreshed_access_token=client.access_token)
         logger.info("已从 session token 换取 accessToken")
 
     if not bundle.access_token:
@@ -351,6 +354,7 @@ async def create_order(
             seat_quantity=seats,
             price_interval=interval,
             billing=billing,
+            session_context=session_context,
         )
     except DomainError as exc:
         store.update_status(order.id, OrderStatus.REJECTED)
@@ -364,6 +368,9 @@ async def create_order(
         )
         raise _from_domain(exc)
     finally:
+        secrets = vault.get(order.id)
+        if secrets is not None:
+            secrets.session = session_context["session"]
         _checkout_tasks.pop(order.id, None)
 
     # 建单最终生效的出口：重试可能换过 SID，支付必须复用
@@ -420,8 +427,8 @@ async def create_order(
 @router.post("/orders/{order_id}/quote", response_model=OrderOut)
 async def refresh_checkout_quote(order_id: str) -> OrderOut:
     order = store.get_order(order_id)
-    if order is None or order.plan not in {Plan.PLUS, Plan.GO}:
-        raise HTTPException(404, "Plus / Go 订单不存在")
+    if order is None or order.plan is Plan.TEAM:
+        raise HTTPException(404, "个人订阅订单不存在")
     async with _team_locks.setdefault(order_id, asyncio.Lock()):
         if order.status is not OrderStatus.AWAITING_PAYMENT:
             raise HTTPException(409, "订单已进入付款流程，请查询原订单状态")
@@ -457,12 +464,16 @@ async def refresh_checkout_quote(order_id: str) -> OrderOut:
             view.amount, order.amount = None, None
             view.quote_error = "读取报价时连接中断，请重试刷新报价"
         finally:
-            client.close()
+            try:
+                secrets.session = session_snapshot(client)
+            finally:
+                client.close()
         return _to_out(order)
 
 
 async def _mark_delivered(order_id: str, *, renewal_checked: bool = False) -> None:
     """Deliver the paid order and close renewal before releasing its session."""
+    store.view(order_id).payment_confirmed = True
     current = store.get_order(order_id)
     if current is not None and current.status is OrderStatus.VERIFYING:
         store.update_status(order_id, OrderStatus.ACTIVE)
@@ -584,7 +595,16 @@ def _team_client(secrets: OrderSecrets, country: str = "") -> ChatGPTClient:
     """
     client = ChatGPTClient.from_raw_session(secrets.session, proxy=secrets.proxy or None)
     client.timeout = 30.0
+    client.stripe_direct = secrets.stripe_direct
     return client
+
+
+def _close_order_client(secrets: OrderSecrets, client) -> None:
+    try:
+        if hasattr(client, "access_token"):
+            secrets.session = session_snapshot(client)
+    finally:
+        client.close()
 
 
 def _team_quote(view, context: dict) -> None:
@@ -634,7 +654,7 @@ async def quote_team(order_id: str, payload: TeamQuoteRequest) -> OrderOut:
             logger.warning("team_quote_error id=%s type=%s elapsed=%.2f", order_id, type(exc).__name__,
                            time.monotonic() - started)
         finally:
-            client.close()
+            _close_order_client(secrets, client)
         return _to_out(order)
 
 
@@ -679,7 +699,7 @@ async def prepare_team(order_id: str, payload: TeamPrepareRequest) -> dict:
                                redact_sensitive(exc.message)[:160])
                 raise _from_domain(exc)
             finally:
-                client.close()
+                _close_order_client(secrets, client)
         secrets.team_context = context
         secrets.billing = billing
         vault.put(order_id, secrets)
@@ -738,7 +758,7 @@ async def _solve_challenge(order_id: str, secrets, view):
         logger.warning("challenge_solve_failed id=%s type=%s", order_id, type(exc).__name__)
         return None
     finally:
-        client.close()
+        _close_order_client(secrets, client)
 
 
 @router.post("/orders/{order_id}/team/poll", response_model=OrderOut)
@@ -748,6 +768,9 @@ async def poll_team(order_id: str) -> OrderOut:
         if order is None or order.plan is not Plan.TEAM:
             raise HTTPException(404, "Team 订单不存在")
         if order.status in {OrderStatus.DELIVERED, OrderStatus.FAILED, OrderStatus.REJECTED}:
+            return _to_out(order)
+        payment_task = _protocol_payment_tasks.get(order_id)
+        if payment_task is not None and not payment_task.done():
             return _to_out(order)
         secrets = vault.get(order_id)
         if secrets is None:
@@ -759,7 +782,7 @@ async def poll_team(order_id: str) -> OrderOut:
         except DomainError as exc:
             raise _from_domain(exc)
         finally:
-            client.close()
+            _close_order_client(secrets, client)
         result = hosted_payment_result(payload, secrets.checkout_session_id, store.view(order_id).checkout_url or "")
         view = store.view(order_id)
         # Complete Stripe's intent challenge here: solving is slow, so it runs during poll
@@ -866,7 +889,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
                                redact_sensitive(exc.message)[:160])
                 raise _from_domain(exc)
             finally:
-                client.close()
+                _close_order_client(secrets, client)
             payload = payload.model_copy(update={"payment_method_token": pm_id})
 
     if payload.billing is not None:
@@ -887,6 +910,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
     if payload.billing is not None:
         view.billing = dict(secrets.billing)
     pipeline = build_pipeline()
+    payment_session_context = {"session": secrets.session}
     store.update_status(order_id, OrderStatus.PAYING)
     try:
         payment = await pipeline.pay(
@@ -902,6 +926,7 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
             billing=secrets.billing or None,
             plan=str(order.plan), team_context=secrets.team_context,
             passive_captcha_token=payload.passive_captcha_token, rv_timestamp=payload.rv_timestamp,
+            session_context=payment_session_context,
         )
     except DomainError as exc:
         uncertain = order.plan is Plan.TEAM and exc.code is ErrorCode.PAYMENT_UNKNOWN_STATE
@@ -917,6 +942,8 @@ async def _pay_order(order_id: str, payload: OrderPayRequest) -> OrderOut:
         # SSE 通知：支付失败
         await notify_order_update(order_id, failed_status, {"error": exc.message})
         raise _from_domain(exc)
+    finally:
+        secrets.session = payment_session_context["session"]
 
     new_status = apply_payment_result(OrderStatus.PAYING, payment.status)
     store.update_status(order_id, new_status)
@@ -1072,6 +1099,9 @@ class ProtocolPayRequest(BaseModel):
     proxy: Optional[str] = Field(default=None, max_length=300)
     publishable_key: Optional[str] = Field(default=None, max_length=120)
     steps: ProtocolStepsIn = ProtocolStepsIn()
+    stripe_direct: bool = False
+    expected_amount: Optional[Decimal] = Field(default=None, ge=0)
+    expected_currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
 
 
 def resolve_protocol_payment_method(payload: "ProtocolPayRequest") -> str:
@@ -1092,6 +1122,7 @@ def resolve_protocol_payment_method(payload: "ProtocolPayRequest") -> str:
 class ProtocolPayOut(BaseModel):
     """纯协议支付的结果。"""
     state: str
+    payment_confirmed: bool = False
     code: Optional[str] = None
     decline_code: Optional[str] = None
     message: Optional[str] = None
@@ -1132,18 +1163,14 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     settings = load_settings()
     captcha_key = getattr(settings, "captcha_api_key", "") or ""
     captcha_url = getattr(settings, "captcha_api_url", "https://api.yescaptcha.com")
-    # 出口按「用户选择的账单地区」自动对齐，并且每次支付用新的 SID：
-    # 复用配置里固定的 SID 会一直撞同一个出口 IP，抽到坏 IP 时整单必挂。
-    proxy = (
-        payload.proxy
-        or session_proxy("checkout", payload.billing.country)
-        or align_proxy_region(configured_proxy("checkout"), payload.billing.country)
-    )
-
     secrets = vault.get(order_id)
     if secrets is None:
         raise _error(401, ErrorCode.SESSION_EXPIRED, "订单凭证已过期，请重新创建结账")
     _assert_saved_card_resolved(secrets)
+    proxy = payload.proxy or secrets.proxy or (
+        session_proxy("checkout", order.billing_country)
+        or align_proxy_region(configured_proxy("checkout"), order.billing_country)
+    )
     session_raw = secrets.session or ""
     publishable_key = (
         (payload.publishable_key or "")
@@ -1157,6 +1184,35 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
     view.card_last4 = payload.card.last4 if payload.card else payload.card_last4
     billing = {k: (v or "").strip() for k, v in payload.billing.model_dump().items()}
     billing["country"] = (billing.get("country") or "US").upper()
+    secrets.billing = billing
+    view.billing = dict(billing)
+    secrets.stripe_direct = payload.stripe_direct
+    if (payload.expected_amount is None) != (payload.expected_currency is None):
+        raise HTTPException(400, "请同时提交已确认的金额和币种")
+    if order.plan is Plan.TEAM and payload.expected_amount is not None:
+        client = _team_client(secrets)
+        try:
+            quote = await asyncio.to_thread(TeamHostedClient(client).quote,
+                session_id=secrets.checkout_session_id, key=publishable_key,
+                billing=billing, currency=currency)
+            _team_quote(view, quote)
+        except DomainError as exc:
+            view.quote_error = exc.message
+            raise _from_domain(exc)
+        except Exception as exc:
+            view.quote_error = "付款前报价读取失败，请刷新报价后重试"
+            logger.warning("team_protocol_quote_failed id=%s type=%s", order_id, type(exc).__name__)
+            raise _error(502, ErrorCode.CHECKOUT_UPSTREAM_ERROR, view.quote_error)
+        finally:
+            _close_order_client(secrets, client)
+    if payload.expected_amount is not None:
+        try:
+            current_amount = Decimal(str(view.amount))
+        except InvalidOperation:
+            raise HTTPException(409, "尚未读到可确认的订单金额")
+        if (not current_amount.is_finite() or payload.expected_amount != current_amount
+                or payload.expected_currency.upper() != str(view.currency or "").upper()):
+            raise HTTPException(409, "订单报价已更新，请确认最新金额后再支付")
 
     # custom checkout 的会话 id 有两种：oaics_（ChatGPT 内部）与 cs_live_（Stripe 自定义）。
     # 单看 URL 前缀会漏掉后者，所以以订单的 checkout_kind 为准。
@@ -1178,6 +1234,8 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                     getattr(view, "customer_session_client_secret", "") or ""),
                 email=billing.get("email") or "",
                 country=billing.get("country") or "",
+                plan=str(order.plan),
+                stripe_direct=payload.stripe_direct,
                 account_id=secrets.account_id,
                 checkout_id=getattr(view, "checkout_session_id", "") or "",
                 confirm_return_url=getattr(view, "confirm_return_url", "") or "",
@@ -1185,6 +1243,9 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
             try:
                 return hp.pay_from_url()
             finally:
+                active_client = getattr(hp, "client", None)
+                if active_client is not None:
+                    secrets.session = session_snapshot(active_client)
                 hp.close()
         if is_custom_checkout:
             # 输入框模式：浏览器已换好 pm_，服务端只做确认，不接触卡号
@@ -1193,17 +1254,23 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 publishable_key=publishable_key, card=card, billing=billing,
                 proxy=proxy, currency=currency,
                 profile=getattr(secrets, "profile", None),
+                stripe_direct=payload.stripe_direct,
             )
             pp.external_pm = pm_id
             try:
                 return pp.pay_from_url()
             finally:
-                pp.close()
+                try:
+                    secrets.session = session_snapshot(pp.client)
+                finally:
+                    pp.close()
         sp = StripeProtocol(
             proxy=proxy, captcha_key=captcha_key, captcha_url=captcha_url,
             card=card, billing=billing,
             profile=getattr(secrets, "profile", None),
             publishable_key=publishable_key,
+            allow_proxy_retry=False,
+            stripe_direct=payload.stripe_direct,
         )
         # 默认全关（批量模式）；网页上勾选后逐项打开
         sp.step_fingerprint = payload.steps.fingerprint
@@ -1217,27 +1284,45 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         finally:
             sp.close()
 
-    try:
-        outcome = await asyncio.to_thread(_run)
-    except DomainError as exc:
-        raise _from_domain(exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("protocol_pay_failed id=%s error=%s", order_id, str(exc)[:200])
-        raise _error(status.HTTP_502_BAD_GATEWAY, ErrorCode.CHECKOUT_UPSTREAM_ERROR, str(exc)[:200])
+    async def complete_payment() -> ProtocolPayOut:
+        try:
+            try:
+                outcome = await asyncio.to_thread(_run)
+            except DomainError as exc:
+                store.update_status(order_id, OrderStatus.UNKNOWN)
+                view.last_error = exc.message
+                raise _from_domain(exc)
+            except Exception as exc:  # noqa: BLE001
+                store.update_status(order_id, OrderStatus.UNKNOWN)
+                view.last_error = "支付结果待核实，请查询订单状态"
+                logger.warning("protocol_pay_failed id=%s error=%s", order_id, redact_sensitive(str(exc))[:200])
+                raise _error(status.HTTP_502_BAD_GATEWAY, ErrorCode.CHECKOUT_UPSTREAM_ERROR, view.last_error)
 
-    logger.info(
-        "protocol_pay id=%s state=%s decline=%s code=%s",
-        order_id, outcome.state, outcome.decline_code, outcome.code,
-    )
-    if outcome.state == "paid":
-        store.update_status(order_id, OrderStatus.PAYING)
-        store.update_status(order_id, OrderStatus.VERIFYING)
-        await _mark_delivered(order_id)
-    return ProtocolPayOut(
-        state=outcome.state, code=outcome.code,
-        decline_code=outcome.decline_code, message=outcome.message,
-        intent_status=outcome.intent_status, charge_id=outcome.charge_id,
-        payment_method_id=outcome.payment_method_id,
-        order=_to_out(order),
-    )
+            logger.info("protocol_pay id=%s state=%s decline=%s code=%s",
+                        order_id, outcome.state, outcome.decline_code, outcome.code)
+            view.last_error = outcome.message
+            if outcome.state == "paid":
+                store.update_status(order_id, OrderStatus.VERIFYING)
+                await _mark_delivered(order_id)
+            elif outcome.state in {"card_declined", "confirm_error", "captcha_rejected"}:
+                store.update_status(order_id, OrderStatus.AWAITING_PAYMENT)
+            elif outcome.state == "challenge_required":
+                store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
+            else:
+                store.update_status(order_id, OrderStatus.UNKNOWN)
+            await notify_order_update(order_id, order.status)
+            return ProtocolPayOut(
+                state=outcome.state, payment_confirmed=view.payment_confirmed, code=outcome.code,
+                decline_code=outcome.decline_code, message=outcome.message,
+                intent_status=outcome.intent_status, charge_id=outcome.charge_id,
+                payment_method_id=outcome.payment_method_id, order=_to_out(order),
+            )
+        finally:
+            _protocol_payment_tasks.pop(order_id, None)
+
+    store.update_status(order_id, OrderStatus.PAYING)
+    view.last_error = None
+    task = asyncio.create_task(complete_payment(), name=f"order:{order_id}")
+    _protocol_payment_tasks[order_id] = task
+    return await asyncio.shield(task)
 

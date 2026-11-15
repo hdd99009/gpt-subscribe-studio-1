@@ -151,13 +151,18 @@ _PLAN_TYPE = {
     "pro_lite": "prolite",
     "pro": "pro",
     "pro_max": "promax",
+    "prolite": "prolite",
+    "promax": "promax",
     "team": "team",
+    "business": "team",
     "chatgptplusplan": "plus",
     "chatgptgoplan": "go",
     "chatgptprolite": "prolite",
     "chatgptpro": "pro",
+    "chatgptproplan": "pro",
     "chatgptpromax": "promax",
     "chatgptteamplan": "team",
+    "chatgptbusinessplan": "team",
 }
 
 # Stripe Checkout 托管页片段（公开 UI 状态，不是密钥）。Team 长链与 153 同源协议。
@@ -669,15 +674,16 @@ class ChatGPTClient:
                     jar.update(cookies)
         self.http.headers.update(self._identity_headers())
 
-    def refresh_session(self, *, failed_path: str = "", failed_method: str = "GET") -> bool:
+    def refresh_session(self, *, force_refresh: bool = False, failed_path: str = "", failed_method: str = "GET") -> bool:
         """用当前出口 IP 请求 /api/auth/session，换取与本批次出口一致的 accessToken 与 cookie。
 
         结账地区由出口代理决定（align_proxy_region），session 本身不绑定国家；
         刷新的目的是让本次请求携带的 accessToken / oai-sc 等 cookie 与出口 IP
         同批次，降低 Cloudflare 403 与 unusual activity 概率。
 
-        软失败：session-token 缺失/失效、上游报错都返回 False，调用方沿用原
-        session 继续，不阻断结账。刷新结果只在内存，不落库。
+        session-token 缺失/失效、上游报错或认证恢复失败时返回 False。
+        force_refresh 主动请求换发令牌，返回相同访问令牌也视为刷新失败。
+        刷新结果保存在客户端内存，由调用方传递给后续步骤。
 
         鉴权拒绝后的恢复携带 refresh=true 与旧令牌签发时间，按浏览器的
         auth recovery 请求换取新令牌。普通会话读取可能仍返回已被拒绝的旧值。
@@ -692,13 +698,11 @@ class ChatGPTClient:
             "chatgpt-account-id": None,
         }
         params = None
+        if force_refresh or failed_path:
+            params = {"refresh": "true", "reason": "token_expired"}
+            headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
         if failed_path:
-            params = {
-                "refresh": "true",
-                "reason": "token_expired",
-                "method": failed_method.upper(),
-                "path": failed_path,
-            }
+            params.update(method=failed_method.upper(), path=failed_path)
             headers.update({
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
@@ -721,8 +725,10 @@ class ChatGPTClient:
         payload = _json(response)
         token = str(payload.get("accessToken") or "").strip()
         recovered_account = jwt_account_id(token)
-        if failed_path and self.account_id and recovered_account and recovered_account != self.account_id:
+        expected_account = self.account_id or jwt_account_id(self.access_token)
+        if (force_refresh or failed_path) and expected_account and recovered_account and recovered_account != expected_account:
             logger.warning("session 恢复返回了不同账号，保留原订单凭证")
+            self.close()
             return False
         refreshed_session = payload.get("sessionToken")
         self._merge_cookies(response, session_token=refreshed_session if isinstance(refreshed_session, str) else "")
@@ -730,13 +736,16 @@ class ChatGPTClient:
         if status >= 400:
             logger.warning("session 刷新失败（HTTP %s），继续用原 session", status)
             return False
+        if payload.get("error"):
+            logger.warning("session 刷新返回认证错误")
+            return False
         if not token:
             # session-token 已失效时上游返回 200 + 空 accessToken。
             logger.warning("session 刷新未返回 accessToken（session-token 可能已失效），继续用原 session")
             return False
         changed = token != self.access_token
-        if failed_path and not changed:
-            logger.warning("session 恢复仍返回已被拒绝的访问令牌")
+        if (force_refresh or failed_path) and not changed:
+            logger.warning("session 刷新未换发新的访问令牌")
             return False
         self.access_token = token
         self.http.headers.update(self._identity_headers())
@@ -1997,11 +2006,18 @@ class ChatGPTClient:
         )
 
 
+def subscription_matches_plan(payload: Dict[str, Any], expected_plan: str) -> bool:
+    entitlement = payload.get("entitlement")
+    entitlement = entitlement if isinstance(entitlement, dict) else {}
+    plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
+    return _PLAN_TYPE.get(plan, plan) == _PLAN_TYPE.get(expected_plan, expected_plan)
+
+
 def _subscription_will_renew(payload: Dict[str, Any], expected_plan: str) -> bool:
     entitlement = payload.get("entitlement")
     entitlement = entitlement if isinstance(entitlement, dict) else {}
     plan = str(payload.get("plan_type") or entitlement.get("subscription_plan") or "").lower()
-    if _PLAN_TYPE.get(plan) != _PLAN_TYPE.get(expected_plan, expected_plan):
+    if not subscription_matches_plan(payload, expected_plan):
         raise DomainError(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, "当前订阅套餐与订单不符，取消续费待核实",
                           detail={"activation_pending": plan in {"free", "chatgptfreeplan"}})
     if payload.get("is_active") is False or entitlement.get("has_active_subscription") is False:

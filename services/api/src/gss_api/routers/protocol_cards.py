@@ -90,8 +90,8 @@ def _run(secrets, context, spec, *, card=None, billing=None, read_only=False):
 
 def _cached(order_id: str) -> dict | None:
     order = store.get_order(order_id)
-    if order is None or order.plan not in {Plan.PLUS, Plan.GO}:
-        raise HTTPException(404, "Plus / Go 订单不存在")
+    if order is None or order.plan is Plan.TEAM:
+        raise HTTPException(404, "个人订阅订单不存在")
     view = store.view(order_id)
     if order.status in {OrderStatus.ACTIVE, OrderStatus.DELIVERED, OrderStatus.FAILED}:
         result = dict(view.protocol_saved_result or {})
@@ -106,8 +106,8 @@ def _cached(order_id: str) -> dict | None:
 
 def _context(order_id: str, *, start: bool):
     order = store.get_order(order_id)
-    if order is None or order.plan not in {Plan.PLUS, Plan.GO}:
-        raise HTTPException(404, "Plus / Go 订单不存在")
+    if order is None or order.plan is Plan.TEAM:
+        raise HTTPException(404, "个人订阅订单不存在")
     secrets = vault.get(order_id)
     if secrets is None:
         raise _error(401, ErrorCode.SESSION_EXPIRED, "订单凭证已过期，请重新创建订单")

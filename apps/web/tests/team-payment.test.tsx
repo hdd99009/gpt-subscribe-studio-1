@@ -7,6 +7,7 @@ import { quoteTeam, prepareTeam, pollTeam, type Order, type TeamHostedContext } 
 import { loadHistory, normalizeHistoryError } from "../src/api/history";
 import { hostedCaptcha } from "../src/card-payment/hostedCaptcha";
 import { TeamPaymentPanel } from "../src/components/TeamPaymentPanel";
+import { ProtocolPayPanel } from "../src/components/ProtocolPayPanel";
 import { emptyTeamCard } from "../src/card-payment/TeamCardForm";
 import { PlanPicker } from "../src/components/PlanPicker";
 import { OrderSummary } from "../src/components/OrderSummary";
@@ -25,12 +26,27 @@ function panel(order: Order | null) {
   );
 }
 
+test("Team protocol offers Stripe direct routing and blocks repeat submission while awaiting verification", () => {
+  const html = renderToStaticMarkup(<MantineProvider><ProtocolPayPanel
+    orderId="order_fixture" plan="team" country="EG" pmMode="server" amount="1150" currency="EGP"
+    submissionDisabled initialBilling={{ name: "Fixture Holder", country: "US" }}
+  /></MantineProvider>);
+  assert.ok(html.includes("Stripe 支付直连"));
+  assert.ok(html.includes("沿用创建结账时的订单代理"));
+  assert.ok(html.includes('data-testid="card-import"'));
+  const buttons = Array.from(html.matchAll(/<button\b[^>]*>.*?<\/button>/g), (match) => match[0]);
+  const paymentButton = buttons.find((button) => button.includes("确认支付"));
+  assert.ok(paymentButton?.includes("disabled"));
+});
+
 test("Team panel before checkout reserves space but does not collect raw card fields", () => {
   const html = panel(null);
   assert.ok(html.includes('data-testid="team-card-form"'));
   assert.ok(html.includes("卡号只用于本次向 Stripe 换取支付标识"));
   assert.ok(html.includes("Team 账单地址"));
   assert.ok(html.includes('data-testid="team-card-number"'));
+  assert.ok(html.includes('data-testid="card-import"'));
+  assert.ok(html.includes("一键导入"));
 });
 
 test("Team card fields stay available regardless of checkout state", () => {

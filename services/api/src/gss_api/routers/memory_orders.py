@@ -19,6 +19,7 @@ def _blocked_reason(order_id: str) -> str | None:
     if lock and lock.locked():
         return "订单请求正在执行，请稍后刷新再清除"
     tasks = (orders._checkout_tasks.get(order_id), orders._renewal_tasks.get(order_id),
+             orders._protocol_payment_tasks.get(order_id),
              protocol_cards._settlement_tasks.get(order_id))
     if any(task is not None and not task.done() for task in tasks):
         return "正在创建结账、核验订阅或关闭续费，请稍后刷新再清除"
@@ -64,6 +65,7 @@ async def clear_memory_orders(payload: MemoryOrdersClearRequest) -> MemoryOrders
         orders._team_locks.pop(order_id, None)
         orders._checkout_tasks.pop(order_id, None)
         orders._renewal_tasks.pop(order_id, None)
+        orders._protocol_payment_tasks.pop(order_id, None)
         protocol_cards._settlement_tasks.pop(order_id, None)
         (deleted if removed else missing).append(order_id)
     for order_id in deleted:

@@ -1,4 +1,5 @@
 import { PasswordInput, SimpleGrid, Stack, Text, TextInput } from "@mantine/core";
+import { CardImport } from "./CardImport";
 
 export interface TeamCardDraft {
   number: string;
@@ -25,6 +26,7 @@ export function TeamCardForm({ value, onChange, disabled }: Props) {
     <Stack gap="sm" data-testid="team-card-form">
       <Text fw={600}>Team 卡片信息</Text>
       <Text size="xs" c="dimmed">卡号只用于本次向 Stripe 换取支付标识，不写入订单记录。</Text>
+      <CardImport onImport={onChange} disabled={disabled} />
       <TextInput label="卡号" value={value.number} onChange={change("number")}
         inputMode="numeric" autoComplete="off" disabled={disabled} data-testid="team-card-number" />
       <SimpleGrid cols={{ base: 1, xs: 3 }}>

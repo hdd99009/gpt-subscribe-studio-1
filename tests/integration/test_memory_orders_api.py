@@ -94,7 +94,7 @@ def test_bulk_clear_only_removes_the_explicit_snapshot(api):
     assert list(store.orders) == [later.id]
 
 
-@pytest.mark.parametrize("activity", ["request", "checkout", "renewal", "settlement", "protocol", "thread"])
+@pytest.mark.parametrize("activity", ["request", "checkout", "renewal", "settlement", "protocol", "hosted_payment", "thread"])
 def test_clear_skips_inflight_operations_and_allows_retry_after_completion(api, activity):
     busy, idle = seed("busy"), seed("idle")
 
@@ -117,6 +117,7 @@ def test_clear_skips_inflight_operations_and_allows_retry_after_completion(api, 
                 vault.drop(busy.id)  # Expired credentials must not hide a live payment worker.
             else:
                 registry = {"checkout": orders._checkout_tasks, "renewal": orders._renewal_tasks,
+                            "hosted_payment": orders._protocol_payment_tasks,
                             "settlement": protocol_cards._settlement_tasks}[activity]
                 registry[busy.id] = task
         try:

@@ -1,8 +1,11 @@
 """Team prepare -> pm -> confirm -> challenge -> server GET poll, without network."""
+import asyncio
 import json
 import time
 from pathlib import Path
+from threading import Event
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,6 +13,7 @@ from gss_api.main import create_app
 from gss_api.store import store
 from gss_core.vault import vault
 from gss_contracts import OrderStatus
+from gss_core.stripe_protocol import PaymentOutcome, StripeProtocol
 
 FIXTURE = json.loads((Path(__file__).parents[1] / "fixtures/team_hosted_success.json").read_text())
 BILLING = {"name": "Fixture", "line1": "Fixture Street", "city": "Fixture City", "state": "OR", "postal_code": "00000", "country": "US"}
@@ -73,6 +77,181 @@ def test_poll_top_level_success_delivers_and_clears_secrets(setup_team):
     # Duplicate poll after delivery must not require secrets or issue another upstream call.
     assert client.post(f"/api/orders/{order_id}/team/poll").json()["status"] == "delivered"
     assert len(calls) == 1
+
+
+def test_team_prepare_poll_and_cancellation_share_rotated_credentials(setup_team, monkeypatch):
+    from gss_api.routers import orders
+
+    client, order_id, _ = setup_team
+    original_hosted = orders.TeamHostedClient
+    received = []
+
+    class StatefulClient:
+        access_token = "fixture-access"
+        extra_cookies = {}
+        def __init__(self, cookie):
+            self.session_token = cookie
+        def close(self):
+            pass
+        def cancel_subscription_renewal(self, *, expected_plan):
+            assert expected_plan == "team" and self.session_token == "poll-cookie"
+            return {"will_renew": False, "already_cancelled": False}
+
+    def factory(secrets, country=""):
+        try:
+            cookie = json.loads(secrets.session)["sessionToken"]
+        except ValueError:
+            cookie = "original-cookie"
+        received.append(cookie)
+        return StatefulClient(cookie)
+
+    class Hosted(original_hosted):
+        def __init__(self, upstream):
+            self.upstream = upstream
+        def prepare(self, **kwargs):
+            self.upstream.session_token = "prepared-cookie"
+            return super().prepare(**kwargs)
+        def poll(self, **kwargs):
+            self.upstream.session_token = "poll-cookie"
+            return super().poll(**kwargs)
+
+    monkeypatch.setattr(orders, "_team_client", factory)
+    monkeypatch.setattr(orders, "TeamHostedClient", Hosted)
+    assert client.post(f"/api/orders/{order_id}/team/prepare", json={"billing": BILLING}).status_code == 200
+    assert json.loads(vault.get(order_id).session)["sessionToken"] == "prepared-cookie"
+    store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
+    result = client.post(f"/api/orders/{order_id}/team/poll")
+    assert result.status_code == 200, result.text
+    assert result.json()["payment_confirmed"] is True
+    assert result.json()["renewal"]["will_renew"] is False
+    assert received == ["original-cookie", "prepared-cookie", "poll-cookie"]
+
+
+def test_team_protocol_reuses_the_checkout_key_and_supports_direct_retry(setup_team, monkeypatch):
+    client, order_id, _ = setup_team
+    view = store.view(order_id)
+    view.checkout_url = "https://pay.openai.com/c/pay/cs_test_fixture"
+    secrets = vault.get(order_id)
+    secrets.proxy = "http://fixed.invalid:3000"
+    routes = []
+
+    def pay(engine, checkout_id):
+        assert checkout_id == "cs_test_fixture"
+        assert engine.publishable_key == view.publishable_key
+        assert engine.allow_proxy_retry is False
+        routes.append(engine.proxy)
+        state = "card_declined" if len(routes) == 1 else "paid"
+        return PaymentOutcome(state=state, intent_status="succeeded" if state == "paid" else "requires_payment_method")
+
+    monkeypatch.setattr(StripeProtocol, "pay", pay)
+    payload = {"payment_method_id": "pm_fixture", "billing": BILLING}
+    failed = client.post(f"/api/orders/{order_id}/pay-protocol", json=payload)
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["order"]["status"] == "awaiting_payment"
+    assert failed.json()["payment_confirmed"] is False
+    paid = client.post(f"/api/orders/{order_id}/pay-protocol", json={**payload, "stripe_direct": True})
+    assert paid.status_code == 200, paid.text
+    assert paid.json()["order"]["status"] == "delivered"
+    assert paid.json()["payment_confirmed"] is True
+    assert paid.json()["order"]["renewal"]["will_renew"] is False
+    assert routes == ["http://fixed.invalid:3000", None]
+
+
+def test_team_protocol_transport_failure_is_queried_without_payment_replay(setup_team, monkeypatch):
+    client, order_id, calls = setup_team
+    store.view(order_id).checkout_url = "https://pay.openai.com/c/pay/cs_test_fixture"
+    attempts = []
+
+    def pay(engine, checkout_id):
+        attempts.append(checkout_id)
+        raise RuntimeError("SSL EOF after payment submission")
+
+    monkeypatch.setattr(StripeProtocol, "pay", pay)
+    payload = {"payment_method_id": "pm_fixture", "billing": BILLING}
+    response = client.post(f"/api/orders/{order_id}/pay-protocol", json=payload)
+    assert response.status_code == 502
+    assert store.get_order(order_id).status is OrderStatus.UNKNOWN
+    assert client.post(f"/api/orders/{order_id}/pay-protocol", json=payload).status_code == 409
+    polled = client.post(f"/api/orders/{order_id}/team/poll")
+    assert polled.status_code == 200, polled.text
+    assert polled.json()["status"] == "delivered"
+    assert polled.json()["renewal"]["will_renew"] is False
+    assert attempts == ["cs_test_fixture"]
+    assert calls[0][0] == "GET-poll"
+
+
+def test_team_protocol_requotes_billing_and_requires_the_updated_amount(setup_team, monkeypatch):
+    from gss_api.routers import orders
+    client, order_id, _ = setup_team
+    store.view(order_id).checkout_url = "https://pay.openai.com/c/pay/cs_test_fixture"
+    calls = []
+
+    class Hosted:
+        def __init__(self, upstream):
+            pass
+        def quote(self, **kwargs):
+            assert kwargs["billing"]["country"] == "US"
+            calls.append("quote")
+            return {"currency": "egp", "amount_minor": 115000}
+
+    def pay(engine, checkout_id):
+        calls.append("pay")
+        return PaymentOutcome(state="paid", intent_status="succeeded")
+
+    monkeypatch.setattr(orders, "TeamHostedClient", Hosted)
+    monkeypatch.setattr(StripeProtocol, "pay", pay)
+    payload = {"payment_method_id": "pm_fixture", "billing": BILLING,
+               "expected_amount": "50", "expected_currency": "EGP"}
+    changed = client.post(f"/api/orders/{order_id}/pay-protocol", json=payload)
+    assert changed.status_code == 409, changed.text
+    assert store.get_order(order_id).status is OrderStatus.AWAITING_PAYMENT
+    assert store.view(order_id).amount == "1150"
+    assert calls == ["quote"]
+    confirmed = client.post(f"/api/orders/{order_id}/pay-protocol", json={**payload, "expected_amount": "1150"})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["order"]["status"] == "delivered"
+    assert calls == ["quote", "quote", "pay"]
+
+
+def test_team_protocol_finishes_after_the_browser_request_disconnects(setup_team, monkeypatch):
+    client, order_id, _ = setup_team
+    from gss_api.routers import orders
+    store.view(order_id).checkout_url = "https://pay.openai.com/c/pay/cs_test_fixture"
+    entered, release = Event(), Event()
+
+    def pay(engine, checkout_id):
+        entered.set()
+        assert release.wait(timeout=5)
+        return PaymentOutcome(state="paid", intent_status="succeeded")
+
+    monkeypatch.setattr(StripeProtocol, "pay", pay)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://test") as api:
+            request = asyncio.create_task(api.post(f"/api/orders/{order_id}/pay-protocol", json={
+                "payment_method_id": "pm_fixture", "billing": BILLING,
+            }))
+            try:
+                assert await asyncio.to_thread(entered.wait, 2)
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                operation = orders._protocol_payment_tasks[order_id]
+                assert not operation.done()
+                pending = await api.post(f"/api/orders/{order_id}/team/poll")
+                assert pending.json()["status"] == "paying"
+                cleared = await api.request("DELETE", "/api/memory-orders", json={"order_ids": [order_id]})
+                assert cleared.json()["skipped"][0]["id"] == order_id
+                release.set()
+                await operation
+                completed = (await api.get(f"/api/orders/{order_id}")).json()
+                assert completed["status"] == "delivered"
+                assert completed["renewal"]["will_renew"] is False
+                assert order_id not in orders._protocol_payment_tasks
+            finally:
+                release.set()
+                await asyncio.gather(request, return_exceptions=True)
+
+    asyncio.run(exercise())
 
 
 def test_client_paid_flag_never_overrides_team_poll(setup_team, monkeypatch):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Iterable, List, Optional
 
@@ -20,6 +20,7 @@ from gss_core.billing import address_for
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
 from gss_core.countries import country_codes, currency_for, locale_for, timezone_for
 from gss_core.proxies import align_proxy_region, configured_proxy, rotate_proxy_sid, session_proxy
+from gss_core.saved_cards import session_snapshot
 
 logger = logging.getLogger("gss.checkout")
 _STRIPE_PROXY_CHECK_URL = "https://api.stripe.com/v1/payment_methods"
@@ -96,6 +97,8 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
     async def create_checkout(self, req: CheckoutRequest) -> CheckoutResult:
         if not req.session:
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法创建结账")
+        if req.session_context is None:
+            req = replace(req, session_context={"session": req.session})
         proxy = align_proxy_region(
             req.proxy or session_proxy("checkout", req.billing_country) or configured_proxy("checkout"),
             req.billing_country,
@@ -162,14 +165,22 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         )
 
     def _create(self, req: CheckoutRequest, proxy: Optional[str]):
-        client = ChatGPTClient.from_raw_session(req.session, proxy=proxy)
+        context = req.session_context if req.session_context is not None else {}
+        client = ChatGPTClient.from_raw_session(context.get("session") or req.session, proxy=proxy)
         client.timeout = float(self.timeout)
         client.language = locale_for(req.billing_country)
         client.timezone = timezone_for(req.billing_country)
-        # 出口已对齐账单国：先用同一出口刷新 session，让 accessToken/cookie 与
-        # 本次 IP 同批次，降低 403 与 unusual activity 概率。软失败不阻断。
-        client.refresh_session()
         try:
+            if client.access_token != context.get("refreshed_access_token"):
+                can_refresh = bool(client.session_token)
+                refreshed = client.refresh_session(force_refresh=True)
+                if can_refresh and not refreshed:
+                    raise DomainError(
+                        ErrorCode.CHECKOUT_UPSTREAM_ERROR,
+                        "建单前未能换发新的访问令牌，请检查代理连接或重新登录后导出完整 Session",
+                    )
+                if refreshed:
+                    context["refreshed_access_token"] = client.access_token
             return client.create_checkout(
                 plan=str(req.plan),
                 country=req.billing_country,
@@ -182,7 +193,10 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
                 billing=req.billing,
             )
         finally:
-            client.close()
+            try:
+                context["session"] = session_snapshot(client)
+            finally:
+                client.close()
 
 
 @dataclass

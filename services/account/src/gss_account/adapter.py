@@ -25,11 +25,15 @@ _ACTIVE_PLANS = {
     "chatgptpro",
     "chatgptproplan",
     "pro_lite",
+    "prolite",
     "chatgptprolite",
     "chatgptpromax",
     "pro_max",
+    "promax",
     "team",
+    "business",
     "chatgptteamplan",
+    "chatgptbusinessplan",
     "enterprise",
     "active",
     "trialing",
@@ -62,9 +66,15 @@ class UpstreamAccountAdapter(AccountAdapterBase):
             raise DomainError(ErrorCode.INVALID_SESSION, "缺少 session，无法查询订阅")
         client = ChatGPTClient.from_raw_session(session, proxy=configured_proxy("checkout"))
         client.timeout = float(self.timeout)
-        payload = client.subscription_payload()
+        try:
+            payload = client.subscription_payload()
+        finally:
+            client.close()
+        entitlement = payload.get("entitlement")
+        entitlement = entitlement if isinstance(entitlement, dict) else {}
         plan_type = str(
             payload.get("plan_type")
+            or entitlement.get("subscription_plan")
             or (payload.get("subscription") or {}).get("plan")
             or (payload.get("plan") or {}).get("type")
             or ""
@@ -74,7 +84,10 @@ class UpstreamAccountAdapter(AccountAdapterBase):
             or payload.get("status")
             or ""
         ).lower()
-        is_active = plan_type in _ACTIVE_PLANS or status in {"active", "trialing", "paid"}
+        is_active = (
+            plan_type in _ACTIVE_PLANS or status in {"active", "trialing", "paid"}
+            or payload.get("is_active") is True or entitlement.get("has_active_subscription") is True
+        ) and payload.get("is_active") is not False and entitlement.get("has_active_subscription") is not False
         expires_at = None
         expires_raw = (
             (payload.get("subscription") or {}).get("expires_at")

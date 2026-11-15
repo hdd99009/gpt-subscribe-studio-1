@@ -53,6 +53,10 @@ export function isPlusOrGo(value: string | undefined): boolean {
   return value === "plus" || value === "go";
 }
 
+export function isPersonalPlan(value: string | undefined): boolean {
+  return isPlusOrGo(value) || value === "pro_lite" || value === "pro" || value === "pro_max";
+}
+
 export function familyOf(value: Plan): Family {
   if (value === "go") return "go";
   if (value === "team") return "team";
