@@ -136,6 +136,8 @@ class TeamHostedClient:
 
     def quote(self, *, session_id: str, key: str, billing: dict[str, str] | None,
               currency: str, browser_locale: str = "en-US", browser_timezone: str = "UTC") -> dict:
+        if getattr(self.client, "browser_profile", None) is not None:
+            browser_locale, browser_timezone = self.client.language, self.client.timezone
         from .chatgpt import expected_amount_minor
         if not re.fullmatch(r"cs_(?:live|test)_[A-Za-z0-9_]+", session_id) or not key.startswith("pk_"):
             raise DomainError(ErrorCode.PAYMENT_UNKNOWN_STATE, "Hosted Checkout 会话或公钥缺失")
@@ -187,12 +189,15 @@ class TeamHostedClient:
                 currency: str, browser_locale: str = "en-US", browser_timezone: str = "UTC",
                 on_quote=None) -> dict:
         from .chatgpt import expected_amount_minor
+        if getattr(self.client, "browser_profile", None) is not None:
+            browser_locale, browser_timezone = self.client.language, self.client.timezone
         quote = self.quote(session_id=session_id, key=key, billing=billing, currency=currency,
                            browser_locale=browser_locale, browser_timezone=browser_timezone)
         if on_quote:
             on_quote(quote)
         amount, code, eid = quote["amount_minor"], quote["currency"], quote["eid"]
-        js_id = str(uuid.uuid4())
+        profile = getattr(self.client, "browser_profile", None)
+        js_id = profile.stripe_js_id if profile is not None else str(uuid.uuid4())
         params = {"key": key, "type": "deferred_intent", "checkout_session_id": session_id,
                   "hosted_surface": "checkout", "elements_init_source": "checkout",
                   "referrer_host": "pay.openai.com", "stripe_js_id": js_id,
@@ -243,7 +248,7 @@ class TeamHostedClient:
         if not timing:
             logger.warning("hosted_timing_missing session=%s 继续确认，稍后由 Stripe 判定", session_id[-8:])
         from .fingerprint import register_device
-        device = register_device(self.http)
+        device = register_device(self.http, profile=profile)
         device["client_session_id"] = js_id
         logger.info("hosted_prepare_ready amount_minor=%s currency=%s captcha=%s fingerprint=%s",
                     amount, code, bool(site_key), bool(device.get("guid")))

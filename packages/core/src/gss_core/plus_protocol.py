@@ -86,8 +86,11 @@ class PlusProtocol:
         self.stripe_direct = stripe_direct
         # 指纹必须与建单、求解器完全一致
         self.profile = dict(profile or {})
+        if self.profile.get("os_key"):
+            from gss_core.har_device import DeviceProfile
+            self.profile = DeviceProfile.from_dict(self.profile).legacy_profile()
         if self.profile:
-            self.ua = self.profile["ua"].format(build=self.profile["build"])
+            self.ua = self.profile["ua"].replace("{build}", str(self.profile["build"]))
             self.platform = self.profile.get("platform", "Linux x86_64")
             self.screen = tuple(self.profile.get("screen", (1920, 1080, 1053)))
         else:
@@ -129,6 +132,12 @@ class PlusProtocol:
         self.client = ChatGPTClient.from_raw_session(self.session, proxy=self.proxy)
         self.client.stripe_direct = self.stripe_direct
         self.client.timeout = timeout
+        if self.client.browser_profile is not None:
+            self.profile = self.client.profile
+            self.ua = self.client.ua
+            self.platform = self.profile["platform"]
+            self.screen = tuple(self.profile["screen"])
+            self.headers = {**self.headers, "User-Agent": self.ua, **self.client.client_hints}
         self._http: Optional[httpx.Client] = None
 
     # ── 资源 ──────────────────────────────────────────────
@@ -145,6 +154,8 @@ class PlusProtocol:
             self._http = None
 
     def _stripe(self) -> httpx.Client:
+        if self._http is None and self.client.browser_profile is not None:
+            return self.client.stripe_http
         if self._http is None:
             self._http = httpx.Client(
                 proxy=None if self.stripe_direct else self.proxy,

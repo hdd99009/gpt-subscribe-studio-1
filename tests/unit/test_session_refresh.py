@@ -250,6 +250,10 @@ class _StubCheckoutClient:
         self.session_token = "original-session"
         self.extra_cookies = {}
 
+    def configure_checkout_environment(self, country):
+        self.language = "en-US"
+        self.timezone = "America/New_York"
+
     def refresh_session(self, *, force_refresh=False) -> bool:
         assert force_refresh is True
         self.calls.append("refresh")

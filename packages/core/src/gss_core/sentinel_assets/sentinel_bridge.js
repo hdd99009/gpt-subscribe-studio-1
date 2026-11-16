@@ -71,7 +71,7 @@ function uuidv4() {
 const SEP = "\u2212"; // U+2212 MINUS SIGN
 const ANS_SDK_URL = "https://sentinel.openai.com/backend-api/sentinel/sdk.js";
 
-function makeGenerator(ua, cores, language, timezone, screenW, screenH) {
+function makeGenerator(ua, cores, language, timezone, screenW, screenH, languages) {
   const initialPerformance = 350.0 + Math.random() * 2200.0;
   const sw = Number(screenW) || 1920;
   const sh = Number(screenH) || 1080;
@@ -79,7 +79,7 @@ function makeGenerator(ua, cores, language, timezone, screenW, screenH) {
     ua,
     cores: cores || 16,
     language: language || "en-US",
-    languages: [language || "en-US", "en-US", "en"],
+    languages: languages || [language || "en-US", "en-US", "en"],
     timezone: timezone || "America/Chicago",
     sid: uuidv4(),
     heapLimit: 4395630592,
@@ -393,6 +393,8 @@ async function handleRequest(raw) {
   const version = args.version || "20260219f9f6";
   const pageUrl = args.pageUrl || "https://auth.openai.com/about-you";
   const language = args.language || "en-US";
+  const languages = Array.isArray(args.languages) && args.languages.length
+    ? args.languages : [language, "en-US", "en"];
   const timezone = args.timezone || "America/Chicago";
   const cookieHeader = args.cookieHeader || "";
   const sentinelOrigin = args.sentinelOrigin || "https://chatgpt.com";
@@ -447,7 +449,9 @@ async function handleRequest(raw) {
     __SEED_DID_VAL__: deviceId,
     __PAGE_URL__: pageUrl,
     __LANGUAGE__: language,
-    __LANGUAGES__: [language, "en-US", "en"],
+    __LANGUAGES__: languages,
+    __MEMORY__: Number(args.memory) || 8,
+    __DPR__: Number(args.devicePixelRatio) || 1,
     __TIMEZONE__: timezone,
     __COOKIE_HEADER__: cookieHeader,
     __PLATFORM__: platform,
@@ -494,7 +498,7 @@ async function handleRequest(raw) {
     return JSON.stringify({ error: "driver 无 c", reason: networkFailure, soErr: rd.soErr || "", raw: String(rawDriver).slice(0, 300) });
   }
 
-  const g = makeGenerator(ua, cores, language, timezone, screenW, screenH);
+  const g = makeGenerator(ua, cores, language, timezone, screenW, screenH, languages);
   let p;
   if (rd.powReq && rd.seed) {
     p = solvePoW(g, rd.seed, rd.diff);

@@ -1,22 +1,13 @@
-"""Per-attempt randomised browser/device profile for the HAR-faithful Plus flow.
+"""Browser profiles shared by session refresh, checkout and payment.
 
-The 2026-10-29 capture was made on one fixed machine
-(macOS / Chrome 156.0.8078.48 / 2560x1326@2x / Asia/Tokyo / en-US).  Replaying
-those exact values would make every order share one device, so this module
-builds a *fresh but internally consistent* device for each payment attempt:
-
-    - OS + Chrome build + UA + User-Agent Client Hints all agree
-    - screen / availHeight / devicePixelRatio / cores / memory agree
-    - timezone + locale agree with the billing country (or an explicit override)
-    - canvas / audio / plugin / connection signals look like a real browser
-    - Stripe ids (guid / muid / sid / fingerprint id / stripe_js_id) are new
-
-Everything that the HAR shows as a per-device value is generated here; every
-value that the HAR shows as protocol structure is left to the flow module.
+Session metadata supplies the original browser values. Per-account defaults
+fill unavailable fields, and order snapshots carry the selected device through
+credential refreshes and payment status queries.
 """
 from __future__ import annotations
 
 import hashlib
+from threading import RLock
 import json
 import os
 import random
@@ -32,6 +23,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
 
 import sys
+import re
+
 
 from .countries import timezone_for
 
@@ -116,6 +109,7 @@ _PLUGINS = (
 )
 
 _ALNUM = string.ascii_letters + string.digits
+_DEVICE_STORE_LOCK = RLock()
 
 
 def _seg_b64(n: int = 32) -> str:
@@ -143,6 +137,34 @@ def _stripe_id() -> str:
 
 def _suffix(n: int = 12) -> str:
     return "".join(secrets.choice(_ALNUM) for _ in range(n))
+
+
+def _browser_transport(ua: str) -> tuple[str, str, str]:
+    from curl_cffi.requests.impersonate import BrowserType
+
+    match = re.search(r"Firefox/([\d.]+)", ua)
+    family, prefix = "firefox", "firefox"
+    if match is None:
+        match = re.search(r"(?:Chrome|CriOS)/([\d.]+)", ua)
+        family = "edge" if "Edg/" in ua else "chrome"
+        prefix = "chrome"
+    if match is None:
+        match = re.search(r"Version/([\d.]+).*Safari/", ua)
+        family, prefix = "safari", "safari"
+    if match is None:
+        return "other", "150.0.0.0", "chrome150"
+    version = match.group(1)
+    major = int(version.split(".")[0])
+    targets = []
+    for browser in BrowserType:
+        target = browser.value
+        candidate = re.fullmatch(prefix + r"(\d+)[a-z]*", target)
+        if candidate:
+            number = candidate.group(1)
+            target_major = int(number[:2]) if prefix == "safari" else int(number)
+            targets.append((target_major, target))
+    selected = min(targets, key=lambda item: abs(item[0] - major))
+    return family, version, selected[1]
 
 
 @dataclass
@@ -193,6 +215,74 @@ class DeviceProfile:
     frame_path: str = ""
     frame_token: str = ""
     created_at: float = field(default_factory=time.time)
+    browser_family: str = "chrome"
+
+    @classmethod
+    def from_session_context(cls, context: Dict[str, Any], *, fallback: Dict[str, Any],
+                             stored: Optional[Dict[str, Any]] = None,
+                             base: Optional["DeviceProfile"] = None) -> "DeviceProfile":
+        """Keep supplied browser metadata while preserving an order's saved device."""
+        if stored:
+            return cls.from_dict(stored)
+        if base is not None:
+            profile = cls.from_dict(base.to_dict())
+        else:
+            profile = cls.random(os_key=fallback.get("key"),
+                                 locale=fallback.get("locale", "en-US"),
+                                 timezone=fallback.get("timezone", "America/New_York"))
+        profile.ua = str(fallback["ua"]).replace("{build}", str(fallback["build"]))
+        profile.chrome_build = str(fallback["build"])
+        profile.chrome_major = profile.chrome_build.split(".")[0]
+        profile.screen_w, profile.screen_h, profile.avail_h = fallback["screen"]
+        ua = context.get("userAgent")
+        if isinstance(ua, str) and ua.strip():
+            if "\r" in ua or "\n" in ua or len(ua) > 2048:
+                raise ValueError("Session 中的浏览器 UA 格式无效")
+            profile.ua = ua.strip()
+        lower = profile.ua.lower()
+        if "windows" in lower:
+            os_key = "windows"
+        elif "macintosh" in lower:
+            os_key = "macos"
+        else:
+            os_key = "linux"
+        platform = _OS_PROFILES[os_key]
+        profile.os_key = os_key
+        profile.platform = platform["platform"]
+        profile.os_label = platform["os_label"]
+        profile.ch_platform = platform["ch_platform"]
+        if os_key != fallback.get("key"):
+            sw, sh, chrome_px, dpr = platform["screens"][0]
+            profile.screen_w, profile.screen_h, profile.avail_h = sw, sh, sh - chrome_px
+            profile.dpr = dpr
+        family, version, target = _browser_transport(profile.ua)
+        profile.browser_family = family
+        profile.chrome_build = version
+        profile.chrome_major = version.split(".")[0]
+        profile.impersonate = target
+        locale = context.get("locale")
+        if isinstance(locale, str) and locale.strip():
+            profile.locale = locale.strip()
+        profile.languages = f"{profile.locale},{profile.locale.split('-')[0]}"
+        timezone = context.get("timezone") or context.get("timeZone")
+        if isinstance(timezone, str) and timezone.strip():
+            profile.timezone = timezone.strip()
+        profile.timezone_offset_min = _offset_minutes(profile.timezone)
+        return profile
+
+    def legacy_profile(self) -> Dict[str, Any]:
+        return {"key": self.os_key, "platform": self.platform, "label": self.os_label,
+                "ua": self.ua, "build": self.chrome_build,
+                "screen": (self.screen_w, self.screen_h, self.avail_h),
+                "locale": self.locale, "timezone": self.timezone, "cores": self.cores,
+                "hints": self.client_hint_headers(), "impersonate": self.impersonate,
+                "browser_family": self.browser_family}
+
+    def identity_key(self) -> str:
+        fields = (self.ua, self.platform, self.screen_w, self.screen_h, self.avail_h, self.dpr,
+                  self.cores, self.memory, self.locale, self.languages, self.timezone,
+                  self.canvas, self.audio, self.plugins, self.impersonate, self.client_hint_headers())
+        return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()[:16]
 
     # ── construction ────────────────────────────────────────────────
     @classmethod
@@ -306,7 +396,8 @@ class DeviceProfile:
     @property
     def sec_ch_ua(self) -> str:
         m = self.chrome_major
-        return f'"Not:A-Brand";v="8", "Chromium";v="{m}", "Google Chrome";v="{m}"'
+        brand = "Microsoft Edge" if self.browser_family == "edge" else "Google Chrome"
+        return f'"Not:A-Brand";v="8", "Chromium";v="{m}", "{brand}";v="{m}"'
 
     @property
     def sec_ch_ua_full_version(self) -> str:
@@ -315,7 +406,8 @@ class DeviceProfile:
     @property
     def sec_ch_ua_full_version_list(self) -> str:
         b = self.chrome_build
-        return f'"Not:A-Brand";v="8.0.0.0", "Chromium";v="{b}", "Google Chrome";v="{b}"'
+        brand = "Microsoft Edge" if self.browser_family == "edge" else "Google Chrome"
+        return f'"Not:A-Brand";v="8.0.0.0", "Chromium";v="{b}", "{brand}";v="{b}"'
 
     @property
     def frame_base(self) -> str:
@@ -336,6 +428,8 @@ class DeviceProfile:
     def client_hint_headers(self) -> Dict[str, str]:
         """`sec-ch-ua*` exactly as the capture sends them (no mobile hints on
         desktop, empty model string included)."""
+        if self.browser_family not in {"chrome", "edge"}:
+            return {}
         headers = {
             "sec-ch-ua": self.sec_ch_ua,
             "sec-ch-ua-mobile": "?0",
@@ -482,33 +576,35 @@ def device_for_account(account_id: str, country: str = "US") -> "DeviceProfile":
     key = str(account_id or "").strip()
     if not key:
         return DeviceProfile.random(country=country)
-    path = _device_store_path()
-    store = _read_store(path)
-    entry = store.get(key)
-    if isinstance(entry, dict):
-        owner = str(entry.pop("owner", key))
-        entry.pop("saved_at", None)
-        if owner == key:
-            try:
-                profile = DeviceProfile.from_dict(entry)
-                profile.rotate_attempt_ids()
-                return profile
-            except Exception:  # noqa: BLE001
-                pass
-    profile = DeviceProfile.random(country=country)
-    payload = profile.to_dict()
-    payload["owner"] = key
-    payload["saved_at"] = int(time.time())
-    store[key] = payload
-    _write_store(path, store)
-    return profile
+    with _DEVICE_STORE_LOCK:
+        path = _device_store_path()
+        store = _read_store(path)
+        entry = store.get(key)
+        if isinstance(entry, dict):
+            owner = str(entry.pop("owner", key))
+            entry.pop("saved_at", None)
+            if owner == key:
+                try:
+                    profile = DeviceProfile.from_dict(entry)
+                    profile.rotate_attempt_ids()
+                    return profile
+                except Exception:  # noqa: BLE001
+                    pass
+        profile = DeviceProfile.random(country=country)
+        payload = profile.to_dict()
+        payload["owner"] = key
+        payload["saved_at"] = int(time.time())
+        store[key] = payload
+        _write_store(path, store)
+        return profile
 
 
 def forget_device(account_id: str) -> None:
-    path = _device_store_path()
-    store = _read_store(path)
-    if store.pop(str(account_id or ""), None) is not None:
-        _write_store(path, store)
+    with _DEVICE_STORE_LOCK:
+        path = _device_store_path()
+        store = _read_store(path)
+        if store.pop(str(account_id or ""), None) is not None:
+            _write_store(path, store)
 
 
 def _host_fingerprint() -> Dict[str, Any]:

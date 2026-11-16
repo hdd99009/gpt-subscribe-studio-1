@@ -97,6 +97,24 @@ test('helper receives the main client browser target and proxy unchanged', async
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('Firefox navigator keeps the session language and supplied device values', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../../packages/core/src/gss_core/sentinel_assets/sentinel_bootstrap.js'), 'utf8');
+  const context = {
+    __UA__: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0',
+    __PLATFORM__: 'Win32', __LANGUAGE__: 'zh-CN', __LANGUAGES__: ['zh-CN', 'zh'],
+    __CORES__: 8, __DPR__: 1.25,
+    setTimeout, clearTimeout, setInterval, clearInterval, URL, TextEncoder, TextDecoder,
+  };
+  vm.createContext(context);
+  vm.runInContext(source, context);
+  assert.equal(context.navigator.userAgent, context.__UA__);
+  assert.equal(context.navigator.language, 'zh-CN');
+  assert.deepEqual(Array.from(context.navigator.languages), ['zh-CN', 'zh']);
+  assert.equal(context.navigator.userAgentData, undefined);
+  assert.equal(context.navigator.vendor, '');
+  assert.equal(context.devicePixelRatio, 1.25);
+});
+
 test('Sentinel navigator high entropy values match the HTTP client hints', async () => {
   const source = fs.readFileSync(path.join(__dirname, '../../packages/core/src/gss_core/sentinel_assets/sentinel_bootstrap.js'), 'utf8');
   const context = {

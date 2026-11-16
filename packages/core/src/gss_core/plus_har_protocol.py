@@ -75,7 +75,7 @@ from gss_core.har_telemetry import (
     TelemetryContext,
     sentinel_ping,
 )
-from gss_core.saved_cards import restore_account
+from gss_core.saved_cards import restore_account, session_snapshot
 from gss_core.money import quote_from_payload
 from gss_core.saved_card_protocol import _factor, _minor, _stripe_error, outcome
 from gss_core.session_token import session_cookie_values
@@ -160,6 +160,17 @@ class PlusHarProtocol:
         self.confirm_return_url = confirm_return_url or ""
         self.is_stripe_custom = self.checkout_id.startswith("cs_")
 
+        if device is None and isinstance(profile, dict) and profile.get("os_key"):
+            device = DeviceProfile.from_dict(profile)
+        if device is None and getattr(client, "browser_profile", None) is not None:
+            device = DeviceProfile.from_dict(client.browser_profile.to_dict())
+        if device is None and session:
+            source_client = ChatGPTClient.from_raw_session(session, proxy=proxy)
+            try:
+                device = source_client.browser_profile
+                self.session = session_snapshot(source_client)
+            finally:
+                source_client.close()
         if device is None and account_id:
             device = device_for_account(account_id, self.country)
         self.device = device or DeviceProfile.random(country=self.country)
@@ -335,8 +346,7 @@ class PlusHarProtocol:
         if self.client is None:
             self.client = ChatGPTClient.from_raw_session(self.session, proxy=self.proxy)
             self.client.timeout = self.timeout
-            self.client.language = self.device.locale
-            self.client.timezone = self.device.timezone
+            self.client.use_browser_profile(self.device)
             try:
                 restore_account(self.client, self.expected_account)
             except DomainError:
@@ -346,8 +356,7 @@ class PlusHarProtocol:
                                   f"读取账号失败：{redact_sensitive(str(exc))[:120]}") from exc
         if not self.client.account_id and self.expected_account:
             self.client.account_id = self.expected_account
-        self.client.language = self.device.locale
-        self.client.timezone = self.device.timezone
+        self.client.use_browser_profile(self.device)
         self.client.stripe_direct = self.stripe_direct
 
         self.telemetry = StripeTelemetry(self._m_session(), TelemetryContext(
@@ -1154,6 +1163,8 @@ def run_har_context(
     stored = context.get("har_device")
     if isinstance(stored, dict) and stored:
         device = DeviceProfile.from_dict(stored)
+    elif getattr(client, "browser_profile", None) is not None:
+        device = DeviceProfile.from_dict(client.browser_profile.to_dict())
     currency = str(spec.get("currency") or "USD").upper()
     country = str(spec.get("country") or (billing or {}).get("country") or "US").upper()
     engine = PlusHarProtocol(

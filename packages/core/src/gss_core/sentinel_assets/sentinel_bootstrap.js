@@ -130,13 +130,15 @@
   navigator.appCodeName = "Mozilla";
   navigator.platform = (g.__PLATFORM__ || "Win32");
   navigator.product = "Gecko";
-  navigator.productSub = "20030107";
-  navigator.vendor = "Google Inc.";
+  var isFirefox = /Firefox\//.test(g.__UA__ || "");
+  var isChromium = /(?:Chrome|Chromium|Edg)\//.test(g.__UA__ || "");
+  navigator.productSub = isFirefox ? "20100101" : "20030107";
+  navigator.vendor = isChromium ? "Google Inc." : "";
   navigator.vendorSub = "";
   navigator.language = g.__LANGUAGE__ || "en-US";
   navigator.languages = g.__LANGUAGES__ || [navigator.language, "en-US", "en"];
   navigator.hardwareConcurrency = g.__CORES__;
-  navigator.deviceMemory = 8;
+  if (isChromium) navigator.deviceMemory = g.__MEMORY__ || 8;
   navigator.maxTouchPoints = 0;
   navigator.doNotTrack = null;
   // 常见 WebAPI 子对象 (collector_dx 会探测)
@@ -154,6 +156,7 @@
   navigator.locks = { request: noopPromise, query: function () { return Promise.resolve({ held: [], pending: [] }); } };
   navigator.mediaCapabilities = { decodingInfo: function () { return Promise.resolve({ supported: true, smooth: true, powerEfficient: true }); } };
   (function () {
+    if (!isChromium) return;
     var match = String(g.__UA__ || "").match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
     var build = match ? match[1] : "150.0.0.0";
     var major = build.split(".")[0];
@@ -204,7 +207,7 @@
   };
   g.innerWidth = (g.__SCREEN_W__ || 1920); g.innerHeight = (g.__AVAIL_H__ || (((g.__SCREEN_W__ || 1920)) - 48));
   g.outerWidth = (g.__SCREEN_W__ || 1920); g.outerHeight = (g.__AVAIL_H__ || (((g.__SCREEN_W__ || 1920)) - 48));
-  g.devicePixelRatio = 1;
+  g.devicePixelRatio = g.__DPR__ || 1;
   g.navigator.maxTouchPoints = (g.__MAX_TOUCH__ || 0);
 
   // ---- history / location ----

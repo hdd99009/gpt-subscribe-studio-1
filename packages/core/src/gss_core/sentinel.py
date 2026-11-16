@@ -153,6 +153,9 @@ def mint(
     cores: int = 8,
     impersonate: str = "chrome150",
     client_hints: Dict[str, str] | None = None,
+    languages: list[str] | None = None,
+    memory: int = 8,
+    device_pixel_ratio: float = 1.0,
 ) -> Dict[str, Any]:
     """返回哨兵 JSON；失败返回空 dict，由调用方决定是否中止。"""
     _diagnostic.failure = {}
@@ -171,6 +174,9 @@ def mint(
             "ua": user_agent,
             "impersonate": impersonate,
             "clientHints": client_hints or {},
+            "languages": languages or [language, "en-US", "en"],
+            "memory": memory,
+            "devicePixelRatio": device_pixel_ratio,
             "cores": cores,
             "deviceId": device_id,
             "flow": flow,

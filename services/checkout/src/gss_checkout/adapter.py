@@ -18,7 +18,7 @@ from gss_contracts import (
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.chatgpt import ChatGPTClient, clamp_team_seats
-from gss_core.countries import country_codes, currency_for, locale_for, timezone_for
+from gss_core.countries import country_codes, currency_for
 from gss_core.proxies import align_proxy_region, configured_proxy, rotate_proxy_sid, session_proxy
 from gss_core.saved_cards import session_snapshot
 
@@ -168,8 +168,7 @@ class UpstreamCheckoutAdapter(CheckoutAdapterBase):
         context = req.session_context if req.session_context is not None else {}
         client = ChatGPTClient.from_raw_session(context.get("session") or req.session, proxy=proxy)
         client.timeout = float(self.timeout)
-        client.language = locale_for(req.billing_country)
-        client.timezone = timezone_for(req.billing_country)
+        client.configure_checkout_environment(req.billing_country)
         try:
             if client.access_token != context.get("refreshed_access_token"):
                 can_refresh = bool(client.session_token)

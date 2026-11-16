@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
@@ -52,6 +53,9 @@ class SessionBundle:
     oai_session_id: str = ""
     cookies: Dict[str, str] = field(default_factory=dict)
     email: str = ""
+    statsig_context: Dict[str, Any] = field(default_factory=dict, repr=False)
+    observed_statsig_context: Dict[str, Any] = field(default_factory=dict, repr=False)
+    browser_profile: Dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 def parse_session(raw: str) -> str:
@@ -143,6 +147,11 @@ def _from_mapping(data: Any) -> SessionBundle:
         cookies=cookies,
         email=(email_from_access_token(token) or _first_string(user, ("email",))
                or _first_string(data, ("email",)) or inner.email),
+        statsig_context=deepcopy(statsig) if isinstance(statsig, dict) else inner.statsig_context,
+        observed_statsig_context=deepcopy(data["observedStatsigContext"])
+            if isinstance(data.get("observedStatsigContext"), dict) else inner.observed_statsig_context,
+        browser_profile=deepcopy(data["browserProfile"])
+            if isinstance(data.get("browserProfile"), dict) else inner.browser_profile,
     )
 
 

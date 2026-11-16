@@ -96,8 +96,9 @@ class UpstreamPaymentAdapter(PaymentAdapterBase):
         context = req.session_context or {}
         client = ChatGPTClient.from_raw_session(context.get("session") or req.session, proxy=proxy)
         client.timeout = float(self.timeout)
-        client.language = locale_for(target_country)
-        client.timezone = timezone_for(target_country)
+        if getattr(client, "browser_profile", None) is None:
+            client.language = locale_for(target_country)
+            client.timezone = timezone_for(target_country)
         try:
             if str(req.plan or "").lower() == "team" and public_checkout_id(checkout_id).startswith("cs_"):
                 return await asyncio.to_thread(self._pay_team, client, req)

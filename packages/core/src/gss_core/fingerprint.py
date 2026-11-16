@@ -59,8 +59,13 @@ def _local_ids() -> Dict[str, str]:
     return {"guid": one(), "muid": one(), "sid": one()}
 
 
-def register_device(session, *, timeout: float = 10.0) -> Dict[str, str]:
+def register_device(session, *, timeout: float = 10.0, profile=None) -> Dict[str, str]:
     """Register a device fingerprint; falls back to local ids when unreachable."""
+    if profile is not None:
+        from .har_telemetry import StripeTelemetry, TelemetryContext
+        telemetry = StripeTelemetry(session, TelemetryContext(device=profile, key="", currency="", amount=0))
+        telemetry.register()
+        return {"guid": profile.guid, "muid": profile.muid, "sid": profile.sid}
     ids = _local_ids()
     fp_id = uuid.uuid4().hex
     sw, sh, dpr = random.choice([(1920, 1080, 1), (1536, 864, 1.25), (2560, 1440, 1)])

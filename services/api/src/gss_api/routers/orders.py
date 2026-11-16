@@ -276,6 +276,7 @@ async def create_order(
     if not bundle.access_token and bundle.session_token:
         client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy)
         try:
+            client.configure_checkout_environment(country)
             refreshed = await asyncio.to_thread(client.refresh_session, force_refresh=True)
         except Exception as exc:
             logger.warning("session token 换取失败: %s", redact_sensitive(str(exc))[:200])
@@ -289,13 +290,7 @@ async def create_order(
                 "session token 已失效或无法换取 accessToken，请重新导出 session",
             )
         bundle.access_token = client.access_token
-        raw_session = json.dumps({
-            "accessToken": client.access_token,
-            "sessionToken": client.session_token,
-            "deviceId": client.device_id,
-            "sessionId": client.oai_session_id,
-            "cookies": client.extra_cookies,
-        })
+        raw_session = session_snapshot(client)
         session_context.update(session=raw_session, refreshed_access_token=client.access_token)
         logger.info("已从 session token 换取 accessToken")
 
@@ -317,6 +312,23 @@ async def create_order(
         if not workspace:
             workspace = "Team Workspace"
 
+    if use_fake_adapters() and not (bundle.statsig_context or bundle.browser_profile):
+        from gss_core.chatgpt import _pick_profile
+        _profile = _pick_profile(bundle.device_id)
+    else:
+        try:
+            identity_client = ChatGPTClient.from_raw_session(raw_session, proxy=exit_proxy)
+        except ValueError as exc:
+            raise _error(400, ErrorCode.INVALID_SESSION, str(exc))
+        try:
+            identity_client.configure_checkout_environment(country)
+            raw_session = session_snapshot(identity_client)
+            session_context["session"] = raw_session
+            _profile = (identity_client.browser_profile.to_dict() if identity_client.browser_profile
+                        else identity_client.profile)
+        finally:
+            identity_client.close()
+
     order = Order(
         idempotency_key=idempotency_key or "",
         plan=plan,
@@ -327,13 +339,6 @@ async def create_order(
     store.create_order(order, idempotency_key)
     store.view(order.id).session_email = bundle.email or None
     store.add_job(Job(order_id=order.id, stage="checkout"))
-    # 指纹 profile：与建单 client 用同一个 device_id 推导，保证全程一致
-    try:
-        from gss_core.chatgpt import _pick_profile as _pick_prof
-        _dev = getattr(bundle, "device_id", "") or ""
-        _profile = _pick_prof(_dev)
-    except Exception:
-        _profile = None
     vault.put(order.id, OrderSecrets(session=raw_session, proxy=exit_proxy or "",
                                   profile=_profile))
     # 建单重试可能换了 SID —— 用最终生效的出口覆盖，保证支付同出口
@@ -1172,6 +1177,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         or align_proxy_region(configured_proxy("checkout"), order.billing_country)
     )
     session_raw = secrets.session or ""
+    payment_profile = parse_session_bundle(session_raw).browser_profile or secrets.profile
     publishable_key = (
         (payload.publishable_key or "")
         or (getattr(view, "publishable_key", "") or "")
@@ -1229,7 +1235,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 session=session_raw, checkout_url=checkout_url,
                 publishable_key=publishable_key, card=card, billing=billing,
                 proxy=proxy, currency=currency,
-                profile=getattr(secrets, "profile", None),
+                profile=payment_profile,
                 customer_session_client_secret=(
                     getattr(view, "customer_session_client_secret", "") or ""),
                 email=billing.get("email") or "",
@@ -1253,7 +1259,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
                 session=session_raw, checkout_url=checkout_url,
                 publishable_key=publishable_key, card=card, billing=billing,
                 proxy=proxy, currency=currency,
-                profile=getattr(secrets, "profile", None),
+                profile=payment_profile,
                 stripe_direct=payload.stripe_direct,
             )
             pp.external_pm = pm_id
@@ -1267,7 +1273,7 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         sp = StripeProtocol(
             proxy=proxy, captcha_key=captcha_key, captcha_url=captcha_url,
             card=card, billing=billing,
-            profile=getattr(secrets, "profile", None),
+            profile=payment_profile,
             publishable_key=publishable_key,
             allow_proxy_retry=False,
             stripe_direct=payload.stripe_direct,
@@ -1282,7 +1288,13 @@ async def _pay_order_protocol(order_id: str, payload: ProtocolPayRequest) -> Pro
         try:
             return sp.pay_from_url(checkout_url)
         finally:
-            sp.close()
+            try:
+                if getattr(sp, "browser_profile", None) is not None:
+                    snapshot = json.loads(secrets.session)
+                    snapshot["browserProfile"] = sp.browser_profile.to_dict()
+                    secrets.session = json.dumps(snapshot)
+            finally:
+                sp.close()
 
     async def complete_payment() -> ProtocolPayOut:
         try:

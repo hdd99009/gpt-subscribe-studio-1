@@ -40,6 +40,34 @@ def test_create_order_retains_manual_billing_through_pipeline(client, plan):
     assert client.get('/api/orders/' + order['id']).json()["billing"] == BILLING
 
 
+def test_manual_region_keeps_source_browser_metadata_and_private_profile(client, plan):
+    from gss_core.vault import vault
+    metadata = {"userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0",
+                "locale": "zh-CN", "deviceId": "source-device", "country": "US", "region": "California"}
+    session = json.dumps({"accessToken": "fixture-access", "statsigContext": metadata})
+    response = client.post("/api/orders", json={"session": session, "plan": plan,
+                                               "billing_country": "PH", "billing": BILLING})
+    assert response.status_code == 201, response.text
+    order = response.json()
+    assert order["billing_country"] == "PH" and order["currency"] == "PHP"
+    secrets = vault.get(order["id"])
+    snapshot = json.loads(secrets.session)
+    assert snapshot["statsigContext"] == metadata
+    assert snapshot["browserProfile"]["ua"] == metadata["userAgent"]
+    assert snapshot["browserProfile"]["locale"] == "zh-CN"
+    assert snapshot["deviceId"] == "source-device"
+    assert secrets.profile == snapshot["browserProfile"]
+    assert "browserProfile" not in order and "statsigContext" not in order
+
+
+def test_invalid_browser_metadata_does_not_leave_a_memory_order(client, plan):
+    session = json.dumps({"accessToken": "fixture-access", "statsigContext": {"userAgent": "fixture\r\ninvalid"}})
+    response = client.post("/api/orders", json={"session": session, "plan": plan,
+                                               "billing_country": "PH", "billing": BILLING})
+    assert response.status_code == 400
+    assert store.orders == {}
+
+
 @pytest.mark.parametrize("billing", [{**BILLING, "line1": "   "}, {**BILLING, "country": "ZZ"},
                                      {**BILLING, "country": "US", "state": ""}])
 def test_invalid_manual_address_does_not_create_order(client, billing, plan):

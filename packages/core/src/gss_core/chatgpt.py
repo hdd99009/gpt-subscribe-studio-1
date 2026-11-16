@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from copy import deepcopy
 import logging
 import os
 import re
@@ -17,7 +18,7 @@ from urllib.parse import quote, urlencode
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.billing import address_for
 from gss_core.countries import currency_for, locale_for, timezone_for
-from gss_core.har_device import _detect_os
+from gss_core.har_device import DeviceProfile, _detect_os, device_for_account
 from gss_core.har_telemetry import sentinel_timing
 from gss_core.money import quote_from_payload
 from gss_core.redaction import redact_sensitive
@@ -469,12 +470,8 @@ def _new_session(*, proxy: Optional[str], timeout: float, impersonate: str = _IM
             ErrorCode.CHECKOUT_UPSTREAM_ERROR,
             "缺少 curl_cffi，无法用浏览器指纹请求 ChatGPT",
         ) from exc
-    try:
-        session = CurlSession(impersonate=impersonate, timeout=timeout,
-                              curl_infos=[CurlInfo.PRETRANSFER_TIME, CurlInfo.STARTTRANSFER_TIME])
-    except Exception:
-        session = CurlSession(impersonate="chrome150", timeout=timeout,
-                              curl_infos=[CurlInfo.PRETRANSFER_TIME, CurlInfo.STARTTRANSFER_TIME])
+    session = CurlSession(impersonate=impersonate, timeout=timeout,
+                          curl_infos=[CurlInfo.PRETRANSFER_TIME, CurlInfo.STARTTRANSFER_TIME])
     if hasattr(session, "trust_env"):
         session.trust_env = False
     proxy = str(proxy or "").strip()
@@ -505,6 +502,10 @@ class ChatGPTClient:
     _stripe_js_id: str = field(default="", repr=False)
     _elements_session_id: str = field(default="", repr=False)
     stripe_direct: bool = False
+    browser_profile: Optional[DeviceProfile] = field(default=None, repr=False)
+    statsig_context: Dict[str, Any] = field(default_factory=dict, repr=False)
+    observed_statsig_context: Dict[str, Any] = field(default_factory=dict, repr=False)
+    _profile_locked: bool = field(default=False, repr=False)
 
     @classmethod
     def from_raw_session(cls, raw: str, proxy: Optional[str] = None) -> "ChatGPTClient":
@@ -514,15 +515,65 @@ class ChatGPTClient:
         seed = token or bundle.session_token
         device = bundle.device_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-did:" + seed))
         session_id = bundle.oai_session_id or str(uuid.uuid5(uuid.NAMESPACE_URL, "dcp-sid:" + seed))
-        return cls(
+        account_id = jwt_account_id(token)
+        base = None
+        if account_id and not bundle.browser_profile:
+            try:
+                base = device_for_account(account_id)
+            except OSError:
+                logger.warning("browser_device_cache_unavailable")
+        try:
+            browser = DeviceProfile.from_session_context(bundle.statsig_context,
+                fallback=_pick_profile(device), stored=bundle.browser_profile or None, base=base)
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Session 中的浏览器配置无效") from exc
+        client = cls(
             access_token=token,
             proxy=proxy,
-            account_id=jwt_account_id(token),
+            account_id=account_id,
             session_token=bundle.session_token,
             device_id=device,
             extra_cookies=dict(bundle.cookies),
             oai_session_id=session_id,
+            browser_profile=browser,
+            statsig_context=deepcopy(bundle.statsig_context),
+            observed_statsig_context=deepcopy(bundle.observed_statsig_context),
+            language=browser.locale,
+            timezone=browser.timezone,
+            _profile_locked=bool(bundle.browser_profile),
         )
+        logger.info("browser_profile id=%s family=%s transport=%s ua_version=%s",
+                    browser.identity_key(), browser.browser_family, browser.impersonate, browser.chrome_build)
+        return client
+
+    def configure_checkout_environment(self, country: str) -> None:
+        if self.browser_profile is None:
+            self.language, self.timezone = locale_for(country), timezone_for(country)
+            return
+        if self._profile_locked:
+            return
+        if not self.statsig_context.get("locale"):
+            self.browser_profile.locale = locale_for(country)
+            locale = self.browser_profile.locale
+            self.browser_profile.languages = f"{locale},{locale.split('-')[0]}"
+        if not (self.statsig_context.get("timezone") or self.statsig_context.get("timeZone")):
+            from gss_core.har_device import _offset_minutes
+            self.browser_profile.timezone = timezone_for(country)
+            self.browser_profile.timezone_offset_min = _offset_minutes(self.browser_profile.timezone)
+        self.language, self.timezone = self.browser_profile.locale, self.browser_profile.timezone
+        self._profile_locked = True
+
+    def use_browser_profile(self, profile: DeviceProfile) -> None:
+        previous_transport = self.browser_profile.impersonate if self.browser_profile else _IMPERSONATE
+        if previous_transport != profile.impersonate:
+            if self._http is not None:
+                self._merge_cookies()
+            self.close()
+        self.browser_profile = profile
+        self.language, self.timezone = profile.locale, profile.timezone
+        self._profile_locked = True
+        if self._http is not None:
+            self._http.headers.update(self._identity_headers())
 
     def _cookie_header(self) -> str:
         values = session_cookie_values(self.session_token, self.extra_cookies)
@@ -532,6 +583,8 @@ class ChatGPTClient:
 
     @property
     def profile(self) -> dict:
+        if self.browser_profile is not None:
+            return self.browser_profile.legacy_profile()
         return _pick_profile(getattr(self, "device_id", "") or "")
 
     @property
@@ -544,16 +597,25 @@ class ChatGPTClient:
 
     @property
     def sec_ch_ua(self) -> str:
+        if self.browser_profile is not None:
+            return self.browser_profile.client_hint_headers().get("sec-ch-ua", "")
         major = self.chrome_major
         return ('"Google Chrome";v="' + major + '", "Chromium";v="' + major
                 + '", "Not(A:Brand";v="24"')
 
     @property
     def ua(self) -> str:
-        return self.profile["ua"].format(build=self.chrome_build)
+        return self.profile["ua"].replace("{build}", str(self.chrome_build))
 
     @property
     def sentinel_profile(self) -> dict:
+        if self.browser_profile is not None:
+            d = self.browser_profile
+            return {"platform": d.platform, "platform_label": d.os_label,
+                    "screen_w": d.screen_w, "screen_h": d.screen_h, "avail_h": d.avail_h,
+                    "cores": d.cores, "memory": d.memory, "device_pixel_ratio": d.dpr,
+                    "languages": d.languages.split(","), "impersonate": d.impersonate,
+                    "client_hints": d.client_hint_headers()}
         p = self.profile
         return {"platform": p["platform"], "platform_label": p["label"],
                 "screen_w": p["screen"][0], "screen_h": p["screen"][1],
@@ -562,6 +624,8 @@ class ChatGPTClient:
 
     @property
     def client_hints(self) -> dict:
+        if self.browser_profile is not None:
+            return self.browser_profile.client_hint_headers()
         full_versions = (f'"Google Chrome";v="{self.chrome_build}", '
                          f'"Chromium";v="{self.chrome_build}", "Not(A:Brand";v="24.0.0.0"')
         return {"sec-ch-ua": self.sec_ch_ua, "sec-ch-ua-mobile": "?0", **self.profile["hints"],
@@ -731,6 +795,8 @@ class ChatGPTClient:
             self.close()
             return False
         refreshed_session = payload.get("sessionToken")
+        if isinstance(payload.get("statsigContext"), dict):
+            self.observed_statsig_context = deepcopy(payload["statsigContext"])
         self._merge_cookies(response, session_token=refreshed_session if isinstance(refreshed_session, str) else "")
         status = int(getattr(response, "status_code", 0) or 0)
         if status >= 400:
@@ -810,8 +876,7 @@ class ChatGPTClient:
 
     def prepare_risk(self, *, flow: str, page_url: str = "", country: str = "") -> None:
         if country:
-            self.language = locale_for(country)
-            self.timezone = timezone_for(country)
+            self.configure_checkout_environment(country)
         url = page_url or f"{APP_BASE}/"
         self.warmup(page_url=url)
         self.mint_sentinel(flow=flow, page_url=url)
@@ -842,7 +907,8 @@ class ChatGPTClient:
     @property
     def http(self):
         if self._http is None:
-            self._http = _new_session(proxy=self.proxy, timeout=self.timeout)
+            options = {"impersonate": self.browser_profile.impersonate} if self.browser_profile else {}
+            self._http = _new_session(proxy=self.proxy, timeout=self.timeout, **options)
             jar = getattr(self._http, "cookies", None)
             setter = getattr(jar, "set", None) if jar is not None else None
             if callable(setter):
@@ -868,7 +934,8 @@ class ChatGPTClient:
     def stripe_http(self):
         if self._stripe_http is None:
             proxy = None if self.stripe_direct else self.proxy
-            self._stripe_http = _new_session(proxy=proxy, timeout=self.timeout)
+            options = {"impersonate": self.browser_profile.impersonate} if self.browser_profile else {}
+            self._stripe_http = _new_session(proxy=proxy, timeout=self.timeout, **options)
             if self.stripe_direct:
                 # Empty explicit proxies also disable libcurl's environment proxy fallback.
                 self._stripe_http.proxies = {"http": "", "https": ""}
@@ -1298,9 +1365,9 @@ class ChatGPTClient:
             body["payment_method_data[client_attribution_metadata][merchant_integration_version]"] = "2021"
             body["payment_method_data[client_attribution_metadata][payment_intent_creation_flow]"] = "deferred"
             body["payment_method_data[client_attribution_metadata][payment_method_selection_flow]"] = "merchant_specified"
-            body["payment_method_data[guid]"] = uuid.uuid4().hex
-            body["payment_method_data[muid]"] = uuid.uuid4().hex
-            body["payment_method_data[sid]"] = uuid.uuid4().hex
+            for name in ("guid", "muid", "sid"):
+                body[f"payment_method_data[{name}]"] = (
+                    getattr(self.browser_profile, name) if self.browser_profile else uuid.uuid4().hex)
             if radar_token:
                 body["payment_method_data[radar_options][hcaptcha_token]"] = radar_token
             body["client_attribution_metadata[client_session_id]"] = _csid
@@ -1568,9 +1635,9 @@ class ChatGPTClient:
             "expected_amount": str(minor),
             "return_url": return_url or stripe_verify_url(session_id),
             "consent[terms_of_service]": "accepted",
-            "guid": _stripe_device_id(),
-            "muid": _stripe_device_id(),
-            "sid": _stripe_device_id(),
+            "guid": self.browser_profile.guid if self.browser_profile else _stripe_device_id(),
+            "muid": self.browser_profile.muid if self.browser_profile else _stripe_device_id(),
+            "sid": self.browser_profile.sid if self.browser_profile else _stripe_device_id(),
             "time_on_page": str(max(8000, int((time.monotonic() - started) * 1000))),
             "client_attribution_metadata[client_session_id]": stripe_js_id,
             "client_attribution_metadata[checkout_session_id]": session_id,

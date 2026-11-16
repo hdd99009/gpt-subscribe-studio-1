@@ -39,13 +39,23 @@ def session_snapshot(client: ChatGPTClient) -> str:
     """Serialize the latest credentials without another upstream request."""
     if getattr(client, "_http", None) is not None:
         client._merge_cookies()
-    return json.dumps({
+    snapshot = {
         "accessToken": client.access_token,
         "sessionToken": client.session_token,
         "deviceId": getattr(client, "device_id", ""),
         "sessionId": getattr(client, "oai_session_id", ""),
         "cookies": dict(getattr(client, "extra_cookies", {})),
-    })
+    }
+    for key, attribute in (("statsigContext", "statsig_context"),
+                           ("observedStatsigContext", "observed_statsig_context")):
+        value = getattr(client, attribute, None)
+        if isinstance(value, dict) and value:
+            snapshot[key] = value
+    from gss_core.har_device import DeviceProfile
+    profile = getattr(client, "browser_profile", None)
+    if isinstance(profile, DeviceProfile):
+        snapshot["browserProfile"] = profile.to_dict()
+    return json.dumps(snapshot)
 
 
 def prepare_account_setup(client: ChatGPTClient, context: dict[str, Any], expected_account: str = "") -> None:

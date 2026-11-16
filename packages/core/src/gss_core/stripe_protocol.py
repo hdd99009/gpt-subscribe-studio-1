@@ -169,7 +169,12 @@ class StripeProtocol:
         self.timezone = ""
         # 指纹必须与建单、求解器完全一致：由调用方传入同一份 profile
         self.profile = dict(profile or _DEFAULT_PROFILE)
-        self.ua = self.profile["ua"].format(build=self.profile["build"])
+        self.browser_profile = None
+        if self.profile.get("os_key"):
+            from gss_core.har_device import DeviceProfile
+            self.browser_profile = DeviceProfile.from_dict(self.profile)
+            self.profile = self.browser_profile.legacy_profile()
+        self.ua = self.profile["ua"].replace("{build}", str(self.profile["build"]))
         self.platform = self.profile["platform"]
         self.screen = tuple(self.profile["screen"])
         self.captcha_key = captcha_key
@@ -223,11 +228,12 @@ class StripeProtocol:
                 if self.proxy:
                     proxies = {"http": self.proxy, "https": self.proxy}
                 self._client = curl_requests.Session(
-                    impersonate="chrome150",
+                    impersonate=self.profile.get("impersonate", "chrome150"),
                     proxies=proxies,
                     timeout=self.timeout,
                     trust_env=not self.stripe_direct,
-                    headers={"Accept": "application/json"},
+                    headers={"Accept": "application/json", "User-Agent": self.ua,
+                             **self.profile.get("hints", {})},
                 )
                 log("   使用 curl_cffi（Chrome TLS 指纹）")
             else:
@@ -256,12 +262,18 @@ class StripeProtocol:
     # ── 请求封装（兼容 httpx 与 curl_cffi）──────────────────
     def _post(self, url: str, data: str, headers: dict[str, str]):
         c = self._http()
+        headers = {**headers, "User-Agent": self.ua, **self.profile.get("hints", {})}
+        if self.profile.get("locale"):
+            headers["Accept-Language"] = self.profile["locale"]
         if _HAS_CURL_CFFI and curl_requests is not None and hasattr(c, "post"):
             return c.post(url, data=data, headers=headers)
         return c.post(url, content=data, headers=headers)
 
     def _get(self, url: str, params: dict[str, Any], headers: dict[str, str]):
         c = self._http()
+        headers = {**headers, "User-Agent": self.ua, **self.profile.get("hints", {})}
+        if self.profile.get("locale"):
+            headers["Accept-Language"] = self.profile["locale"]
         return c.get(url, params=params, headers=headers)
 
 
@@ -294,6 +306,10 @@ class StripeProtocol:
 
     # ── ① 指纹 ──────────────────────────────────────────────
     def register_fingerprint(self) -> Fingerprint:
+        if self.browser_profile is not None:
+            from .fingerprint import register_device
+            ids = register_device(self._http(), profile=self.browser_profile)
+            return Fingerprint(**ids, client_session_id=self.browser_profile.stripe_js_id)
         log("① m.stripe.com/6 注册指纹")
         guid, muid, sid = _hex_id(), _hex_id(), _hex_id()
         fp_id = os.urandom(16).hex()
@@ -458,6 +474,8 @@ class StripeProtocol:
         只做一件事：查出口 IP 供日志留痕，并在出口国家与账单国家不一致时告警。
         locale/timezone 不再跟随 IP——住宅池会漂移，跟着漂会制造矛盾指纹。
         """
+        if self.profile.get("locale") and self.profile.get("timezone"):
+            return self.profile["locale"], self.profile["timezone"]
         country = (self.billing.get("country") or "US").upper()
         locale, tz = self._LOCALE_BY_COUNTRY.get(country, ("en-US", "America/New_York"))
 
@@ -504,7 +522,7 @@ class StripeProtocol:
 
     def init_checkout(self, cs_id: str) -> tuple[dict[str, Any], CheckoutContext]:
         log("② init")
-        js_id = str(uuid.uuid4())
+        js_id = self.browser_profile.stripe_js_id if self.browser_profile else str(uuid.uuid4())
         locale, tz = self._align_locale(self.proxy)
         # 求解器必须复用同一组值（init 时已发给 Stripe）
         self.locale, self.timezone = locale, tz
@@ -944,8 +962,12 @@ class StripeProtocol:
             self._sleep(random.uniform(1.0, 2.0))
         else:
             # 批量模式：不发 m.stripe.com/6，直接用随机 guid/muid/sid
-            fp = Fingerprint(guid=str(uuid.uuid4()), muid=str(uuid.uuid4()),
-                             sid=str(uuid.uuid4()))
+            if self.browser_profile:
+                device = self.browser_profile
+                fp = Fingerprint(guid=device.guid, muid=device.muid, sid=device.sid,
+                                 client_session_id=device.stripe_js_id)
+            else:
+                fp = Fingerprint(guid=str(uuid.uuid4()), muid=str(uuid.uuid4()), sid=str(uuid.uuid4()))
             log("① 跳过指纹注册（默认模式：随机 guid/muid/sid）")
 
         _, ctx = self.init_checkout(cs_id)
