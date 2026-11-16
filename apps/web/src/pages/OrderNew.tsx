@@ -32,7 +32,7 @@ import { CheckoutLinkCard } from "../components/CheckoutLinkCard";
 import { emptyTeamCard, type TeamCardDraft } from "../card-payment/TeamCardForm";
 import { BillingForm } from "../components/BillingForm";
 import { protocolBillingError } from "../card-payment/protocolBind";
-import { isPersonalPlan, isPlusOrGo, planLabel } from "../plans";
+import { isPersonalPlan, planLabel } from "../plans";
 
 interface Props {
   onRecord: (order: Order) => void;
@@ -504,7 +504,7 @@ export function OrderNew({ onRecord, clearedOrderIds }: Props) {
                     <Text size="sm" c="dimmed">创建结账时会提交这份地址核算税费，取得报价后再填写卡片和确认付款。请填写发卡行登记的账单信息。</Text>
                     <TextInput label="账单邮箱" type="email" value={checkoutBilling.email || ""} autoComplete="email" disabled={busy || checkingSession}
                       onChange={(event) => setCheckoutBilling({ ...checkoutBilling, email: event.currentTarget.value })} />
-                    <BillingForm independentCountry compact randomize={isPlusOrGo(plan)} value={checkoutBilling} onChange={setCheckoutBilling} disabled={busy} />
+                    <BillingForm independentCountry compact randomize value={checkoutBilling} onChange={setCheckoutBilling} disabled={busy} />
                   </Stack>
                 </Paper>
               )}
