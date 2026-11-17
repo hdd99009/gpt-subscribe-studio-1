@@ -75,7 +75,7 @@ def _run(secrets, context, spec, *, card=None, billing=None, read_only=False):
                     store.update_status(order.id, OrderStatus.VERIFYING)
                     logger.info("protocol_payment_confirmed id=%s", order.id)
                 plan = str(spec.get("plan") or "plus")
-                context["renewal"] = _cancel_renewal(secrets, plan, client=client)
+                context["renewal"] = _cancel_renewal(secrets, plan, client=client, order_id=order.id if order else "")
                 if context["renewal"]["status"] == "cancelled":
                     result = {**result, "state": "paid", "stage": "payment", "intent_status": "succeeded",
                               "message": f"付款已确认，{plan.title()} 订阅已生效，自动续费已关闭"}

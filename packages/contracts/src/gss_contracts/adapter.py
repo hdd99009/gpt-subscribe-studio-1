@@ -143,6 +143,7 @@ class SubscriptionInfo:
     expires_at: Optional[datetime] = None
     channel: Optional[str] = None
     raw_kind: Optional[str] = None
+    started_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)

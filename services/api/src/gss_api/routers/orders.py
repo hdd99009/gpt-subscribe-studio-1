@@ -24,6 +24,7 @@ from gss_contracts import (
     Order,
     OrderStatus,
     Plan,
+    SubscriptionInfo,
 )
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.config import load_settings, use_fake_adapters
@@ -34,7 +35,7 @@ from gss_core.plus_har_protocol import PlusHarProtocol
 from gss_core.stripe_protocol import StripeProtocol, PaymentOutcome
 from gss_core.proxies import align_proxy_region, configured_proxy, session_proxy
 from gss_core.redaction import redact_sensitive
-from gss_core.chatgpt import ChatGPTClient, clamp_team_seats, _processor_from_checkout_url
+from gss_core.chatgpt import ChatGPTClient, clamp_team_seats, _processor_from_checkout_url, subscription_matches_plan
 from gss_core.session_token import (
     parse_session_bundle,
 )
@@ -103,6 +104,7 @@ def _to_out(order: Order) -> OrderOut:
             active=view.subscription.active,
             expires_at=view.subscription.expires_at.isoformat() if view.subscription.expires_at else None,
             channel=view.subscription.channel,
+            started_at=view.subscription.started_at.isoformat() if view.subscription.started_at else None,
         )
     # 账号邮箱随订单保留，凭证清理后仍可用于展示开通记录。
     session_email = view.session_email or ""
@@ -505,7 +507,16 @@ async def _mark_delivered(order_id: str, *, renewal_checked: bool = False) -> No
     await notify_order_update(order_id, OrderStatus.DELIVERED, event)
 
 
-def _cancel_renewal(secrets: OrderSecrets, plan: str, *, client=None) -> dict:
+def _capture_subscription(order_id: str, client) -> None:
+    info = getattr(client, "last_subscription", None)
+    order = store.get_order(order_id)
+    if not order or not isinstance(info, SubscriptionInfo) or not info.active:
+        return
+    if subscription_matches_plan({"plan_type": info.raw_kind}, str(order.plan)):
+        store.view(order_id).subscription = info
+
+
+def _cancel_renewal(secrets: OrderSecrets, plan: str, *, client=None, order_id: str = "") -> dict:
     owned = client is None
     try:
         if owned:
@@ -524,6 +535,8 @@ def _cancel_renewal(secrets: OrderSecrets, plan: str, *, client=None) -> dict:
         message = redact_sensitive(exc.message)[:240] if isinstance(exc, DomainError) else "取消续费结果暂未确认，请重试关闭自动续费"
         return {"status": "failed", "message": message, "retryable": retryable}
     finally:
+        if order_id and client is not None:
+            _capture_subscription(order_id, client)
         if owned and client is not None:
             if hasattr(client, "access_token"):
                 secrets.session = session_snapshot(client)
@@ -533,7 +546,7 @@ def _cancel_renewal(secrets: OrderSecrets, plan: str, *, client=None) -> dict:
 async def _finish_renewal(order_id: str, secrets: OrderSecrets, plan: str) -> None:
     view = store.view(order_id)
     try:
-        view.renewal = await asyncio.to_thread(_cancel_renewal, secrets, plan)
+        view.renewal = await asyncio.to_thread(_cancel_renewal, secrets, plan, order_id=order_id)
         order = store.get_order(order_id)
         if view.renewal["status"] == "cancelled":
             if order and view.payment_confirmed and order.status is OrderStatus.VERIFYING:

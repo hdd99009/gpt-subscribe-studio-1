@@ -22,7 +22,7 @@ export interface Order {
   last_error?: string | null;
   quote_error?: string | null;
   next_action?: { type?: string; url?: string | null; client_secret?: string | null; challenge_type?: string; checkout_url?: string } | null;
-  subscription?: { active: boolean; expires_at?: string | null; channel?: string | null } | null;
+  subscription?: { active: boolean; started_at?: string | null; expires_at?: string | null; channel?: string | null } | null;
   payment_confirmed?: boolean;
   renewal?: {
     status: "pending" | "cancelled" | "failed";
@@ -400,6 +400,17 @@ export async function getBindAndPayProtocol(orderId: string): Promise<BindAndPay
   const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/bind-and-pay-protocol`);
   if (!res.ok) throw new Error(await readError(res));
   return (await res.json()) as BindAndPayProtocolResult;
+}
+
+export function formatBeijingTime(value?: string | null): string | null {
+  if (!value) return null;
+  const timestamp = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : `${value}Z`;
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return null;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).format(date);
 }
 
 export function formatAmount(amount?: string | null, currency?: string | null): string | null {

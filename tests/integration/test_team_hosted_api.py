@@ -2,6 +2,7 @@
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 from gss_api.main import create_app
 from gss_api.store import store
 from gss_core.vault import vault
-from gss_contracts import OrderStatus
+from gss_contracts import OrderStatus, SubscriptionInfo
 from gss_core.stripe_protocol import PaymentOutcome, StripeProtocol
 
 FIXTURE = json.loads((Path(__file__).parents[1] / "fixtures/team_hosted_success.json").read_text())
@@ -77,6 +78,37 @@ def test_poll_top_level_success_delivers_and_clears_secrets(setup_team):
     # Duplicate poll after delivery must not require secrets or issue another upstream call.
     assert client.post(f"/api/orders/{order_id}/team/poll").json()["status"] == "delivered"
     assert len(calls) == 1
+
+
+def test_team_summary_retains_subscription_dates_after_cancellation(setup_team, monkeypatch):
+    client, order_id, _ = setup_team
+
+    class SubscriptionClient:
+        last_subscription = None
+
+        def cancel_subscription_renewal(self, *, expected_plan):
+            assert expected_plan == "team"
+            self.last_subscription = SubscriptionInfo(
+                active=True, raw_kind="business",
+                started_at=datetime(2026, 11, 16, 0, 49, 43, tzinfo=timezone.utc),
+                expires_at=datetime(2026, 12, 16, 6, 49, 43, tzinfo=timezone.utc),
+            )
+            return {"will_renew": False, "already_cancelled": False}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("gss_api.routers.orders._team_client", lambda *args: SubscriptionClient())
+    store.view(order_id).session_email = "team-account@example.invalid"
+    store.update_status(order_id, OrderStatus.REQUIRES_ACTION)
+    result = client.post(f"/api/orders/{order_id}/team/poll")
+    assert result.status_code == 200, result.text
+    subscription = result.json()["subscription"]
+    assert subscription["started_at"] == "2026-11-16T00:49:43+00:00"
+    assert subscription["expires_at"] == "2026-12-16T06:49:43+00:00"
+    assert result.json()["session_email"] == "team-account@example.invalid"
+    assert vault.get(order_id) is None
+    assert client.get(f"/api/orders/{order_id}").json()["subscription"] == subscription
 
 
 def test_team_prepare_poll_and_cancellation_share_rotated_credentials(setup_team, monkeypatch):

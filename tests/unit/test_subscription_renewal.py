@@ -73,6 +73,24 @@ def test_cancels_once_and_requires_subscription_readback(client_factory):
     assert headers["originator"] == "Codex Browser"
 
 
+@pytest.mark.parametrize("already_cancelled", [False, True])
+def test_existing_cancellation_queries_retain_subscription_dates(client_factory, already_cancelled):
+    from datetime import datetime, timezone
+
+    fields = {"active_start": "2026-11-16T00:49:43Z",
+              "active_until": "2026-12-16T00:49:43Z",
+              "entitlement": {"expires_at": "2026-12-16T06:49:43+00:00"}}
+    before = {**subscription(not already_cancelled), **fields}
+    after = {**subscription(False), **fields}
+    client, calls = client_factory([before] if already_cancelled else [before, after])
+    assert client.cancel_subscription_renewal(expected_plan="plus") == {
+        "will_renew": False, "already_cancelled": already_cancelled,
+    }
+    assert client.last_subscription.started_at == datetime(2026, 11, 16, 0, 49, 43, tzinfo=timezone.utc)
+    assert client.last_subscription.expires_at == datetime(2026, 12, 16, 6, 49, 43, tzinfo=timezone.utc)
+    assert [call[0] for call in calls] == (["GET"] if already_cancelled else ["GET", "POST", "GET"])
+
+
 @pytest.mark.parametrize("expected,reported", [
     ("go", "go"), ("pro_lite", "prolite"), ("pro_lite", "chatgptprolite"),
     ("pro", "pro"), ("pro", "chatgptpro"),

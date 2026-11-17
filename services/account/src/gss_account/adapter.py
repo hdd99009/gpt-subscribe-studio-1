@@ -15,30 +15,7 @@ from gss_contracts import (
 from gss_contracts.errors import DomainError, ErrorCode
 from gss_core.chatgpt import ChatGPTClient
 from gss_core.proxies import configured_proxy
-
-_ACTIVE_PLANS = {
-    "plus",
-    "chatgptplusplan",
-    "go",
-    "chatgptgoplan",
-    "pro",
-    "chatgptpro",
-    "chatgptproplan",
-    "pro_lite",
-    "prolite",
-    "chatgptprolite",
-    "chatgptpromax",
-    "pro_max",
-    "promax",
-    "team",
-    "business",
-    "chatgptteamplan",
-    "chatgptbusinessplan",
-    "enterprise",
-    "active",
-    "trialing",
-    "paid",
-}
+from gss_core.subscriptions import subscription_info_from_payload
 
 
 class AccountAdapterBase:
@@ -70,40 +47,7 @@ class UpstreamAccountAdapter(AccountAdapterBase):
             payload = client.subscription_payload()
         finally:
             client.close()
-        entitlement = payload.get("entitlement")
-        entitlement = entitlement if isinstance(entitlement, dict) else {}
-        plan_type = str(
-            payload.get("plan_type")
-            or entitlement.get("subscription_plan")
-            or (payload.get("subscription") or {}).get("plan")
-            or (payload.get("plan") or {}).get("type")
-            or ""
-        ).lower()
-        status = str(
-            (payload.get("subscription") or {}).get("status")
-            or payload.get("status")
-            or ""
-        ).lower()
-        is_active = (
-            plan_type in _ACTIVE_PLANS or status in {"active", "trialing", "paid"}
-            or payload.get("is_active") is True or entitlement.get("has_active_subscription") is True
-        ) and payload.get("is_active") is not False and entitlement.get("has_active_subscription") is not False
-        expires_at = None
-        expires_raw = (
-            (payload.get("subscription") or {}).get("expires_at")
-            or payload.get("expires_at")
-        )
-        if isinstance(expires_raw, str) and expires_raw:
-            try:
-                expires_at = datetime.fromisoformat(expires_raw.replace("Z", "+00:00"))
-            except ValueError:
-                expires_at = None
-        return SubscriptionInfo(
-            active=is_active,
-            expires_at=expires_at,
-            channel="card" if is_active else None,
-            raw_kind=plan_type or status or "unknown",
-        )
+        return subscription_info_from_payload(payload)
 
     async def promo_eligibility(self, session: str) -> PromoEligibility:
         if not session:

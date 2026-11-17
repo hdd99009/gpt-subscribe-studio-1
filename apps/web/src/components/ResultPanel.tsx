@@ -2,7 +2,7 @@ import { Alert, Anchor, Button, Group, Loader, Stack, Text, ThemeIcon, Title } f
 import { IconCheck, IconX } from "@tabler/icons-react";
 import { useState } from "react";
 
-import { cancelOrderRenewal, formatAmount, type Order } from "../api/client";
+import { cancelOrderRenewal, formatAmount, formatBeijingTime, type Order } from "../api/client";
 import { FAILED_STATUSES, SUCCESS_STATUSES } from "../api/history";
 import { planLabel, regionLabel } from "../plans";
 import { STATUS_LABELS } from "./OrderSummary";
@@ -20,6 +20,7 @@ export function ResultPanel({ order, protocolOnly = false, onReset, onOrderChang
   const success = SUCCESS_STATUSES.includes(order.status);
   const failed = FAILED_STATUSES.includes(order.status);
   const amount = formatAmount(order.amount, order.currency);
+  const expiresAtBeijing = formatBeijingTime(order.subscription?.expires_at);
   const color = success ? "green" : failed ? "red" : "yellow";
   const title = success
     ? "开通成功"
@@ -50,7 +51,9 @@ export function ResultPanel({ order, protocolOnly = false, onReset, onOrderChang
 
       {order.subscription?.active && (
         <Alert color="green" variant="light" title="订阅已生效">
-          {order.subscription.expires_at ? `到期时间 ${order.subscription.expires_at}` : "订阅已经生效。"}
+          {expiresAtBeijing
+            ? `权益到期时间 ${expiresAtBeijing}（北京时间）`
+            : "订阅已经生效。"}
         </Alert>
       )}
       {(success || order.payment_confirmed) && order.renewal && (

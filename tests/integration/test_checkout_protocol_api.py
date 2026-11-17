@@ -100,7 +100,8 @@ def flow(monkeypatch, request):
                 record("subscription_get")
                 return response({"plan_type": state.get("subscription_plan", plan), "is_active": state["active"],
                     "will_renew": state["will_renew"],
-                    "entitlement": {"has_active_subscription": state["active"], "subscription_plan": f"chatgpt{plan}plan"}})
+                    "entitlement": {"has_active_subscription": state["active"], "subscription_plan": f"chatgpt{plan}plan"},
+                    **state.get("subscription_fields", {})})
             state["violations"].append("unexpected GET " + url)
             raise AssertionError(url)
         def post(self, url, **kwargs):
@@ -240,6 +241,56 @@ def names(flow): return [c["name"] for c in flow.state["calls"]]
 
 def test_unused_get_is_local_and_has_no_writes(flow):
     assert get(flow)["state"] == "not_started"
+    assert not flow.state["calls"]
+
+
+def test_paid_order_retains_account_email_and_subscription_dates_after_secret_cleanup(flow):
+    store.view(flow.oid).session_email = "account@example.invalid"
+    flow.state["subscription_fields"] = {
+        "active_start": "2026-11-16T00:49:43Z", "active_until": "2026-12-16T00:49:43Z",
+        "entitlement": {"expires_at": "2026-12-16T06:49:43+00:00"},
+    }
+    result = post(flow)
+    assert result["state"] == "paid" and result["order"]["status"] == "delivered"
+    subscription = result["order"]["subscription"]
+    assert subscription["active"] is True
+    assert subscription["started_at"] == "2026-11-16T00:49:43+00:00"
+    assert subscription["expires_at"] == "2026-12-16T06:49:43+00:00"
+    assert result["order"]["session_email"] == "account@example.invalid"
+    assert result["order"]["billing"]["email"] == flow.body["billing"]["email"]
+    assert vault.get(flow.oid) is None
+    before = list(flow.state["calls"])
+    refreshed = flow.api.get(f"/api/orders/{flow.oid}").json()
+    assert refreshed["subscription"] == subscription
+    assert refreshed["session_email"] == "account@example.invalid"
+    assert get(flow)["order"]["subscription"] == subscription
+    assert flow.state["calls"] == before
+
+
+def test_paid_subscription_dates_remain_available_when_renewal_verification_fails(flow):
+    flow.state["renewal_http"] = 400
+    flow.state["subscription_fields"] = {
+        "active_start": "2026-11-16T00:49:43Z",
+        "entitlement": {"expires_at": "2026-12-16T06:49:43Z"},
+    }
+    result = post(flow)
+    assert result["payment_confirmed"] is True
+    assert result["order"]["subscription"]["started_at"] == "2026-11-16T00:49:43+00:00"
+    assert result["order"]["subscription"]["expires_at"] == "2026-12-16T06:49:43+00:00"
+    assert vault.get(flow.oid) is not None
+
+
+def test_another_plan_does_not_supply_subscription_dates_for_the_order(flow):
+    from gss_api.routers.orders import _capture_subscription
+    from gss_core.subscriptions import subscription_info_from_payload
+
+    old_subscription = subscription_info_from_payload({
+        "plan_type": "go" if flow.plan == "plus" else "plus", "is_active": True,
+        "active_start": "2026-11-15T00:00:00Z",
+        "entitlement": {"expires_at": "2026-11-17T00:00:00Z"},
+    })
+    _capture_subscription(flow.oid, SimpleNamespace(last_subscription=old_subscription))
+    assert flow.api.get(f"/api/orders/{flow.oid}").json()["subscription"] is None
     assert not flow.state["calls"]
 
 

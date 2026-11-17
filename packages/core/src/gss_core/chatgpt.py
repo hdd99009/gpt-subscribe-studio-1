@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import quote, urlencode
 
 from gss_contracts.errors import DomainError, ErrorCode
+from gss_contracts import SubscriptionInfo
 from gss_core.billing import address_for
 from gss_core.countries import currency_for, locale_for, timezone_for
 from gss_core.har_device import DeviceProfile, _detect_os, device_for_account
@@ -30,6 +31,7 @@ from gss_core.session_token import (
     session_cookie_values,
     session_token_from_cookies,
 )
+from gss_core.subscriptions import subscription_info_from_payload
 
 APP_BASE = "https://chatgpt.com"
 CHECKOUT_PAGE = f"{APP_BASE}/settings/billing?source=chatgpt_web_merged"
@@ -506,6 +508,7 @@ class ChatGPTClient:
     statsig_context: Dict[str, Any] = field(default_factory=dict, repr=False)
     observed_statsig_context: Dict[str, Any] = field(default_factory=dict, repr=False)
     _profile_locked: bool = field(default=False, repr=False)
+    last_subscription: Optional[SubscriptionInfo] = field(default=None, repr=False)
 
     @classmethod
     def from_raw_session(cls, raw: str, proxy: Optional[str] = None) -> "ChatGPTClient":
@@ -2014,11 +2017,14 @@ class ChatGPTClient:
         status = int(getattr(response, "status_code", 0) or 0)
         payload = _json(response)
         if status == 404 and allow_missing and payload.get("detail") == "No subscription found for account":
-            return {"plan_type": "free", "is_active": False}
+            payload = {"plan_type": "free", "is_active": False}
+            self.last_subscription = subscription_info_from_payload(payload)
+            return payload
         if status == 401:
             raise DomainError(ErrorCode.INVALID_SESSION, "Session 无效或已过期")
         if status >= 400:
             self._raise(ErrorCode.SUBSCRIPTION_NOT_ACTIVE, response, "查询订阅")
+        self.last_subscription = subscription_info_from_payload(payload)
         return payload
 
     def cancel_subscription_renewal(self, *, expected_plan: str) -> Dict[str, Any]:

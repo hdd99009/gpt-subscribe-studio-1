@@ -78,6 +78,7 @@ class SubscriptionOut(BaseModel):
     active: bool
     expires_at: Optional[str] = None
     channel: Optional[str] = None
+    started_at: Optional[str] = None
 
 
 class RenewalOut(BaseModel):

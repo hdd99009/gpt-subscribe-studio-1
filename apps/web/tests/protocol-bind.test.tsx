@@ -9,6 +9,7 @@ import {
   checkSession,
   clearMemoryOrders,
   createOrder,
+  formatBeijingTime,
   getBindAndPayProtocol,
   listMemoryOrders,
   type BindAndPayProtocolInput,
@@ -26,6 +27,7 @@ import { OrderNew } from "../src/pages/OrderNew";
 import { isPersonalPlan, isPlusOrGo, planLabel } from "../src/plans";
 import { App } from "../src/App";
 import { MemoryOrders } from "../src/components/MemoryOrders";
+import { OrderSummary } from "../src/components/OrderSummary";
 import { subscribeOrderUpdates } from "../src/api/events";
 
 const order: Order = {
@@ -43,6 +45,60 @@ function renderPanel(plan: Plan = "plus") {
     plan={plan} bindBeforePay country="DE" sessionEmail="fixture@example.invalid" amount="20" currency="usd"
     publishableKey="pk_test_fixture" checkoutUrl={order.checkout_url} pmMode="stripe" /></form></MantineProvider>);
 }
+
+test("subscription times render in Beijing regardless of the local timezone", () => {
+  const previousTimezone = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  try {
+    assert.equal(formatBeijingTime("2026-11-16T00:49:43Z"), "2026/11/16 08:49:43");
+    assert.equal(formatBeijingTime("2026-12-16T06:49:43+00:00"), "2026/12/16 14:49:43");
+    assert.equal(formatBeijingTime("2026-11-16T08:49:43+08:00"), "2026/11/16 08:49:43");
+    assert.equal(formatBeijingTime("2026-11-15T16:49:43-08:00"), "2026/11/16 08:49:43");
+    assert.equal(formatBeijingTime("2026-11-16T00:49:43"), "2026/11/16 08:49:43");
+    assert.equal(formatBeijingTime("2026-11-16T16:00:00Z"), "2026/11/17 00:00:00");
+    for (const value of [null, undefined, "", "invalid"]) {
+      assert.equal(formatBeijingTime(value), null);
+    }
+  } finally {
+    if (previousTimezone === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTimezone;
+  }
+});
+
+test("paid summaries show the account email and entitlement dates for every plan", () => {
+  for (const plan of ["plus", "go", "pro_lite", "pro", "pro_max", "team"] as const) {
+    const paid: Order = {
+      ...order, plan, status: "delivered", payment_confirmed: true,
+      session_email: "account@example.invalid", billing: { email: "receipt@example.invalid" },
+      subscription: { active: true, started_at: "2026-11-16T00:49:43Z", expires_at: "2026-12-16T06:49:43Z" },
+    };
+    const html = renderToStaticMarkup(<MantineProvider>
+      <OrderSummary plan={plan} country="PH" order={paid} />
+    </MantineProvider>);
+    for (const value of ["充值邮箱", "account@example.invalid", "开通时间", "2026/11/16 08:49:43",
+      "到期时间", "2026/12/16 14:49:43", "北京时间", "权益截止时间"]) {
+      assert.ok(html.includes(value), value);
+    }
+    assert.ok(!html.includes("receipt@example.invalid"));
+  }
+});
+
+test("paid legacy and pending snapshots keep unknown subscription dates explicit", () => {
+  for (const paid of [
+    { ...order, status: "delivered", subscription: { active: true } },
+    { ...order, status: "verifying", payment_confirmed: true },
+  ]) {
+    const html = renderToStaticMarkup(<MantineProvider>
+      <OrderSummary plan="plus" country="PH" order={paid} />
+    </MantineProvider>);
+    assert.ok(html.includes("充值邮箱") && html.includes("开通时间") && html.includes("到期时间"));
+    assert.equal((html.match(/待获取/g) || []).length, 3);
+  }
+  const html = renderToStaticMarkup(<MantineProvider>
+    <OrderSummary plan="plus" country="PH" order={order} />
+  </MantineProvider>);
+  assert.ok(!html.includes("充值邮箱") && !html.includes("开通时间"));
+});
 
 test("card import reads labeled PAN CVV and expiry with Chinese punctuation and preserves leading zeroes", () => {
   const cardLine = "卡号:" + input.card.number;

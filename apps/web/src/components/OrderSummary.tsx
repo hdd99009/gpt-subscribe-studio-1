@@ -1,6 +1,6 @@
 import { Badge, Divider, Group, Paper, Stack, Text, Title } from "@mantine/core";
 
-import { formatAmount, isHostedOrder, type Order, type Plan } from "../api/client";
+import { formatAmount, formatBeijingTime, isHostedOrder, type Order, type Plan } from "../api/client";
 import { FAILED_STATUSES, SUCCESS_STATUSES } from "../api/history";
 import { planLabel, regionLabel } from "../plans";
 
@@ -73,6 +73,15 @@ export function OrderSummary({ plan, country, order, seats }: Props) {
         {plan === "team" && due && (
           <Text size="xs" c="dimmed">Stripe 当前报价；确认前会按账单地址重算税费。</Text>
         )}
+        {order && (order.payment_confirmed || SUCCESS_STATUSES.includes(order.status)) && (
+          <>
+            <Divider />
+            <Row label="充值邮箱" value={order.session_email || "待获取"} muted={!order.session_email} />
+            <Row label="开通时间" value={formatBeijingTime(order.subscription?.started_at) || "待获取"} />
+            <Row label="到期时间" value={formatBeijingTime(order.subscription?.expires_at) || "待获取"} />
+            <Text size="xs" c="dimmed">北京时间（UTC+8），到期时间采用权益截止时间。</Text>
+          </>
+        )}
         {order && (
           <Text size="xs" c="dimmed" style={{ wordBreak: "break-all" }}>
             订单 {order.id}
@@ -86,10 +95,11 @@ export function OrderSummary({ plan, country, order, seats }: Props) {
 function Row({ label, value, muted }: { label: string; value: string; muted?: boolean }) {
   return (
     <Group justify="space-between" wrap="nowrap">
-      <Text size="sm" c="dimmed">
+      <Text size="sm" c="dimmed" style={{ flexShrink: 0 }}>
         {label}
       </Text>
-      <Text size="sm" fw={500} c={muted ? "dimmed" : undefined}>
+      <Text size="sm" fw={500} ta="right" c={muted ? "dimmed" : undefined}
+        style={{ minWidth: 0, overflowWrap: "anywhere" }}>
         {value}
       </Text>
     </Group>
